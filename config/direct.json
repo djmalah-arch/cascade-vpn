@@ -1,5 +1,5 @@
 {
- "_comment": "Traffic that must NOT go through the VPN (games etc). Edit, then run: geovpn-apply-direct",
+ "_comment": "Traffic that must NOT go through the VPN (games etc). Default list; install.sh copies it to data/portal/direct.json. On MSK edit that copy, then: docker exec geovpn-portal geovpn apply-direct",
  "domains": [
   "steampowered.com", "steamcommunity.com", "steamcontent.com", "steamserver.net", "steamstatic.com",
   "steamusercontent.com", "steam-chat.com", "steamgames.com", "valvesoftware.com", "counter-strike.net",
