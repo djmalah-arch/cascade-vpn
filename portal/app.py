@@ -642,7 +642,10 @@ def background():
             if not mon.get("youtube") and warm:
                 log_error("YouTube с MSK недоступен (проверь IPv6 и zapret, ADMIN.md 6.4)")
         except Exception as e:
-            log_error(f"Фоновая задача портала: {e!r}")
+            if time.time() - STARTED > STARTUP_GRACE:
+                log_error(f"Фоновая задача портала: {e!r}")
+            else:
+                print("background (startup, not logged):", repr(e), flush=True)
         time.sleep(60)
 
 

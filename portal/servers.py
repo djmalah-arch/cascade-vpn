@@ -321,7 +321,13 @@ def probe_all(db):
                 c["fail"], c["ok"] = c["fail"] + 1, 0
                 if c["up"] and c["fail"] >= FAILS_TO_DOWN:
                     c["up"] = False
-                    C.log_error(f"Выход {e['name']} недоступен с MSK (IPv4: {STATUS[eid].get('v4')}, IPv6: {STATUS[eid].get('v6')})")
+                    if not starting_up():
+                        C.log_error(f"Выход {e['name']} недоступен с MSK (IPv4: {STATUS[eid].get('v4')}, IPv6: {STATUS[eid].get('v6')})")
+
+
+def starting_up():
+    """Portal just started or a server is being added/removed: nodes may be down for a moment, don't raise alarms."""
+    return time.time() - C.STARTED < C.STARTUP_GRACE or any(not j["done"] for j in JOBS.values())
 
 
 def is_up(eid):
@@ -361,14 +367,15 @@ def watchdog_tick():
                 fresh = C.load_db(); fresh["msk"] = db["msk"]; fresh["balancer"] = db["balancer"]; C.save_db(fresh)
     except Exception as ex:
         print("msk ip check:", repr(ex), flush=True)
+    quiet = starting_up()
     try:
         # quiet while the portal is starting or a server is being added/removed (its node is not up yet)
-        quiet = time.time() - C.STARTED < C.STARTUP_GRACE or any(not j["done"] for j in JOBS.values())
         for n in ([] if quiet else C.rw("GET", "/api/nodes")):
             if not n.get("isConnected") and not n.get("isDisabled"):
                 C.log_error(f"Нода {n['name']} ({n['address']}) не на связи с панелью: {(n.get('lastStatusMessage') or '')[:160]}")
     except Exception as ex:
-        C.log_error(f"Панель Remnawave не отвечает: {ex}")
+        if not quiet:
+            C.log_error(f"Панель Remnawave не отвечает: {ex}")
     probe_all(db)
     plan = compute_plan(db)
     old = db["balancer"].get("plan")
@@ -392,7 +399,10 @@ def watchdog():
         try:
             watchdog_tick()
         except Exception as e:
-            C.log_error(f"Сторож балансировщика: {e!r}")
+            if starting_up():
+                print("watchdog (startup, not logged):", repr(e), flush=True)
+            else:
+                C.log_error(f"Сторож балансировщика: {e!r}")
         time.sleep(PROBE_EVERY)
 
 
