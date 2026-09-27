@@ -699,7 +699,7 @@ def preflight(c, want, sshport=22):
             if n_ not in names and f_ not in names and d_ not in used_dirs:
                 sug.update(node_name=n_, fw_name=f_, node_dir=d_)
                 break
-    return conflicts, sug, {"docker": info.get("DOCKER") == "1", "ufw": "active" in info.get("UFW", ""), "ours": sorted(ours)}
+    return conflicts, sug, {"docker": info.get("DOCKER") == "1", "ufw": info.get("UFW", "").strip() == "Status: active", "ours": sorted(ours)}
 
 
 def node_image():
