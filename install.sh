@@ -95,7 +95,8 @@ c_info "1/6 Docker и сетевые настройки ядра"
 export DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1   # no needrestart progress bars / prompts
 command -v curl >/dev/null || { apt-get update -qq && apt-get install -y -qq curl ca-certificates >/dev/null; }
 command -v openssl >/dev/null || apt-get install -y -qq openssl >/dev/null
-command -v docker >/dev/null || { curl -fsSL https://get.docker.com | sh >/var/log/geovpn-docker-install.log 2>&1 \n  || { tail -20 /var/log/geovpn-docker-install.log; die "не удалось установить Docker (см. выше)"; }; }
+command -v docker >/dev/null || { curl -fsSL https://get.docker.com | sh >/var/log/geovpn-docker-install.log 2>&1 \
+  || { tail -20 /var/log/geovpn-docker-install.log; die "не удалось установить Docker (см. выше)"; }; }
 docker compose version >/dev/null || die "docker compose plugin missing"
 cat > /etc/sysctl.d/99-geovpn.conf <<'EOF'
 net.core.default_qdisc = fq
