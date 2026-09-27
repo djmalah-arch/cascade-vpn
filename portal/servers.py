@@ -4,7 +4,7 @@ The portal owns the MSK xray profile: it is generated from db["exits"] (priority
 A watchdog probes every exit (via per-exit local inbounds on MSK) and rebuilds the chain
 primary -> reserve 1 -> reserve 2 ... when availability changes.
 """
-import datetime as dt, json, re, secrets, socket, threading, time, traceback
+import datetime as dt, json, os, re, secrets, socket, threading, time, traceback
 from concurrent.futures import ThreadPoolExecutor
 
 import app as C
@@ -566,7 +566,6 @@ for p in __PORT__ __NPORT__; do
   if ss -Htln | awk '{print $4}' | grep -qE "[:.]$p\$"; then echo "PORT_BUSY $p"; exit 17; fi
 done
 if [ -e __DIR__ ]; then echo "DIR_BUSY __DIR__"; exit 18; fi
-command -v docker >/dev/null || curl -fsSL https://get.docker.com | sh >/var/log/geovpn-docker-install.log 2>&1
 if docker ps -a --format '{{.Names}}' | grep -qxE '__NODE__|__FW__'; then echo "NAME_BUSY"; exit 19; fi
 cat >/etc/sysctl.d/99-geovpn.conf <<'X'
 net.core.default_qdisc = fq
@@ -581,7 +580,8 @@ services:
   remnanode:
     container_name: __NODE__
     hostname: __NODE__
-    image: __IMAGE__
+    image: __NTAG__
+    pull_policy: never
     restart: always
     network_mode: host
     cap_add: [NET_ADMIN]
@@ -594,16 +594,14 @@ services:
   geovpn-fw:
     container_name: __FW__
     labels: ["geovpn.msk=__MSKID__"]
-    image: geovpn/fw
-    build:
-      dockerfile_inline: |
-        FROM debian:trixie-slim
-        RUN apt-get update && apt-get install -y --no-install-recommends iptables && rm -rf /var/lib/apt/lists/*
+    image: __FTAG__
+    pull_policy: never
     restart: always
     network_mode: host
     cap_add: [NET_ADMIN, NET_RAW]
     volumes: ["./fw:/conf"]
-    command: ["/conf/fw.sh", "loop"]
+    entrypoint: ["/conf/fw.sh"]
+    command: ["loop"]
 X
 printf 'ALLOW="%s"\nALLOW6="%s"\nNODE_PORT=%s\nCHAIN=%s\n' "__MSK4__" "__MSK6__" "__NPORT__" "__CHAIN__" >__DIR__/fw/fw.env
 cat >__DIR__/fw/fw.sh <<'X'
@@ -657,7 +655,7 @@ chmod +x __DIR__/fw/fw.sh
 if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
   if ! ufw status | grep -qE "^__PORT__(/tcp)? "; then ufw allow __PORT__/tcp >/dev/null && touch __DIR__/.ufw-opened && echo "ufw: opened __PORT__/tcp"; fi
 fi
-cd __DIR__ && docker compose build -q geovpn-fw && docker compose pull -q remnanode && docker compose up -d 2>&1 | tail -1
+cd __DIR__ && docker compose up -d 2>&1 | tail -1
 sleep 2; docker exec __FW__ iptables -C INPUT -p tcp --dport __NPORT__ -j __CHAIN__
 echo "node installed on $(hostname) in __DIR__"
 """
@@ -683,6 +681,66 @@ if [ -f /etc/systemd/system/geovpn-fw.service ]; then
 fi
 echo "node removed from $(hostname)"
 """
+
+# Images for the exit: the node image (tagged locally) and the fw image built on top of it (+ iptables from Debian).
+# Some hosting networks get 403 from Docker Hub (seen 2026-09-27, NetCrafters/Helsinki): then the portal ships both
+# images from MSK over SSH (ship_images).
+IMAGES = r"""
+set -e
+export DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1
+command -v docker >/dev/null || curl -fsSL https://get.docker.com | sh >/var/log/geovpn-docker-install.log 2>&1
+if ! docker image inspect __NTAG__ >/dev/null 2>&1; then
+  if timeout 600 docker pull -q __IMAGE__ >/dev/null 2>&1; then docker tag __IMAGE__ __NTAG__; else echo "NEED_SHIP: Docker Hub недоступен с сервера"; exit 0; fi
+fi
+if ! docker image inspect __FTAG__ >/dev/null 2>&1; then
+  printf '__FWDOCKERFILE__' | DOCKER_BUILDKIT=0 timeout 600 docker build -q -t __FTAG__ - >/dev/null 2>&1 \
+    || { echo "NEED_SHIP: не удалось собрать образ файрвола на сервере"; exit 0; }
+fi
+echo "IMAGES_OK"
+"""
+FW_DOCKERFILE = "FROM {base}\\nRUN apt-get update && apt-get install -y --no-install-recommends iptables && rm -rf /var/lib/apt/lists/*\\n"
+
+
+def image_tags():
+    """Local tags used on exits: geovpn/node:<digest12> and geovpn/fw:<digest12> (the fw image is FROM the node image)."""
+    img = node_image()
+    t = re.sub(r"[^a-f0-9]", "", img.split("@sha256:")[-1])[:12] if "@sha256:" in img else re.sub(r"[^A-Za-z0-9_.-]", "-", img)[-40:]
+    return img, f"geovpn/node:{t}", f"geovpn/fw:{t}"
+
+
+def images_script():
+    img, ntag, ftag = image_tags()
+    return (IMAGES.replace("__IMAGE__", img).replace("__NTAG__", ntag).replace("__FTAG__", ftag)
+            .replace("__FWDOCKERFILE__", FW_DOCKERFILE.format(base=ntag)))
+
+
+def ship_images(c, log):
+    """Build the exit images on MSK (it has the node image) and copy them to the exit over SSH."""
+    img, ntag, ftag = image_tags()
+    tmp = "/tmp/geovpn-exit-images.tar.gz"
+    rc, _ = C.sh(["docker", "image", "inspect", ntag])
+    if rc != 0:
+        rc, out = C.sh(["docker", "tag", img, ntag])
+        if rc != 0:
+            raise RuntimeError(f"на MSK нет образа ноды {img}: {out}")
+    if C.sh(["docker", "image", "inspect", ftag])[0] != 0:
+        log("  собираю образ файрвола на MSK…")
+        rc, out = C.sh(f"printf '{FW_DOCKERFILE.format(base=ntag)}' | DOCKER_BUILDKIT=0 docker build -q -t {ftag} - 2>&1", timeout=900)
+        if rc != 0:
+            raise RuntimeError(f"не удалось собрать образ файрвола на MSK: {out[-300:]}")
+    rc, out = C.sh(f"docker save {ntag} {ftag} | gzip -1 > {tmp}", timeout=900)
+    if rc != 0:
+        raise RuntimeError(f"docker save на MSK: {out[-300:]}")
+    size = os.path.getsize(tmp) // (1 << 20)
+    log(f"  передаю образы на сервер ({size} МБ)…")
+    try:
+        sftp = c.open_sftp()
+        sftp.put(tmp, tmp)
+        sftp.close()
+    finally:
+        os.remove(tmp)
+    ssh_run(c, f"gunzip -c {tmp} | docker load >/dev/null && rm -f {tmp} && docker image inspect {ntag} {ftag} >/dev/null && echo loaded", log)
+
 
 # read-only look at the server before installing: busy TCP ports (+ process), container names, /opt, our old installs
 PREFLIGHT = r"""
@@ -879,7 +937,14 @@ def do_add(log, f):
         created["node"] = e["node_uuid"] = node["uuid"]
         secret = C.rw("GET", "/api/keygen")["secretKey"]
         log(f"Устанавливаю ноду в {w['node_dir']} (контейнеры {w['node_name']}, {w['fw_name']}; 1–3 минуты)…")
-        script = (NODE_INSTALL.replace("__IMAGE__", node_image()).replace("__SECRET__", secret)
+        log("Готовлю образы на сервере (Docker, нода, файрвол)…")
+        created["remote"] = True
+        out = ssh_run(c, images_script())
+        if "NEED_SHIP" in out:
+            log("  " + out.strip().splitlines()[-1].replace("NEED_SHIP: ", "") + " — передаю образы с MSK по SSH.")
+            ship_images(c, log)
+        _, ntag, ftag = image_tags()
+        script = (NODE_INSTALL.replace("__NTAG__", ntag).replace("__FTAG__", ftag).replace("__SECRET__", secret)
                   .replace("__MSK4__", msk_addrs(db)[0]).replace("__MSK6__", msk_addrs(db)[1])
                   .replace("__PORT__", str(port)).replace("__NPORT__", str(nport)).replace("__DIR__", w["node_dir"])
                   .replace("__NODE__", w["node_name"]).replace("__FW__", w["fw_name"]).replace("__CHAIN__", fw_chain(w["fw_name"])).replace("__MSKID__", msk_id()))
