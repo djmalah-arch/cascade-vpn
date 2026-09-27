@@ -17,21 +17,8 @@ FAILS_TO_DOWN, OKS_TO_UP = 2, 2
 
 PORTAL_KEY = C.P("ssh/geovpn_portal", "/root/.ssh/geovpn_portal")  # restricted key: only updates MSK address in exits' firewall
 
-# installed on every exit; the portal key in authorized_keys is forced to run this (command=...)
-FW_SET = r"""#!/bin/bash
-# GeoVPN: the only thing MSK's portal key may do on this server: "set-msk <msk-ipv4> <msk-ipv6|->"
-read -r cmd v4 v6 extra <<< "$SSH_ORIGINAL_COMMAND"
-[ "$cmd" = "set-msk" ] && [ -z "$extra" ] || { echo "denied"; exit 1; }
-python3 - "$v4" "$v6" <<'P' || { echo "bad address"; exit 1; }
-import ipaddress, sys
-ipaddress.IPv4Address(sys.argv[1])
-if sys.argv[2] != "-": ipaddress.IPv6Address(sys.argv[2])
-P
-[ "$v6" = "-" ] && v6=""
-sed -i "s|^ALLOW=.*|ALLOW=\"$v4\"|; s|^ALLOW6=.*|ALLOW6=\"$v6\"|" /usr/local/bin/geovpn-fw.sh
-systemctl restart geovpn-fw
-echo "ok $v4 ${v6:--}"
-"""
+# the portal key in exits' authorized_keys is forced to run this: it can only set MSK's address in the fw container
+FW_CMD = "docker exec -e SSH_ORIGINAL_COMMAND geovpn-fw /conf/fw.sh set"
 
 STATUS = {}          # id -> {"ok","ms","ip","v4","v6","ts"}
 COUNTERS = {}        # id -> {"fail": n, "ok": n, "up": bool}
@@ -89,14 +76,8 @@ def portal_pubkey():
 
 
 def install_fw_key(c):
-    """On an exit (open paramiko session as root): install geovpn-fw-set + the restricted portal key."""
-    sftp = c.open_sftp()
-    with sftp.file("/usr/local/bin/geovpn-fw-set", "w") as fh:
-        fh.write(FW_SET)
-    sftp.chmod("/usr/local/bin/geovpn-fw-set", 0o755)
-    sftp.close()
-    line = ('command="/usr/local/bin/geovpn-fw-set",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty '
-            + portal_pubkey())
+    """On an exit (open paramiko session as root): add the restricted portal key (runs FW_CMD only)."""
+    line = (f'command="{FW_CMD}",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty ' + portal_pubkey())
     _, o, _ = c.exec_command("mkdir -p /root/.ssh && touch /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys"
                              " && sed -i '/geovpn-portal-fw/d' /root/.ssh/authorized_keys"
                              f" && echo '{line}' >> /root/.ssh/authorized_keys && echo ok", timeout=20)
@@ -498,7 +479,8 @@ net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 X
 sysctl --system >/dev/null 2>&1 || true
-mkdir -p /opt/remnanode
+# everything else lives in /opt/remnanode and runs in docker: remnanode + geovpn-fw (node port 2222 only from MSK)
+mkdir -p /opt/remnanode/fw
 cat >/opt/remnanode/docker-compose.yml <<'X'
 services:
   remnanode:
@@ -513,45 +495,70 @@ services:
     environment:
       - NODE_PORT=2222
       - SECRET_KEY=__SECRET__
+    depends_on: [geovpn-fw]
+  geovpn-fw:
+    container_name: geovpn-fw
+    image: geovpn/fw
+    build:
+      dockerfile_inline: |
+        FROM debian:trixie-slim
+        RUN apt-get update && apt-get install -y --no-install-recommends iptables && rm -rf /var/lib/apt/lists/*
+    restart: always
+    network_mode: host
+    cap_add: [NET_ADMIN, NET_RAW]
+    volumes: ["./fw:/conf"]
+    command: ["/conf/fw.sh", "loop"]
 X
-cat >/usr/local/bin/geovpn-fw.sh <<'X'
+[ -f /opt/remnanode/fw/fw.env ] || printf 'ALLOW="%s"\nALLOW6="%s"\n' "__MSK4__" "__MSK6__" >/opt/remnanode/fw/fw.env
+cat >/opt/remnanode/fw/fw.sh <<'X'
 #!/bin/bash
-ALLOW="__MSK4__"
-ALLOW6="__MSK6__"
-for T in iptables ip6tables; do
-  $T -D INPUT -p tcp --dport 2222 -j GEOVPN_NODE 2>/dev/null
-  $T -F GEOVPN_NODE 2>/dev/null || $T -N GEOVPN_NODE
-  if [ $T = iptables ]; then L=$ALLOW; else L=$ALLOW6; fi
-  for s in $L; do $T -A GEOVPN_NODE -s "$s" -j RETURN; done
-  $T -A GEOVPN_NODE -j DROP
-  $T -I INPUT -p tcp --dport 2222 -j GEOVPN_NODE
-done
+# geovpn-fw container: node API port 2222 is reachable only from the MSK entry server.
+#   fw.sh loop  - apply rules, re-apply if something (ufw reload, reboot) removed them
+#   fw.sh set   - "set-msk <ipv4> <ipv6|->" from the restricted portal SSH key (SSH_ORIGINAL_COMMAND)
+#   fw.sh clear - remove the rules (node removal)
+apply() {
+  . /conf/fw.env
+  for T in iptables ip6tables; do
+    $T -D INPUT -p tcp --dport 2222 -j GEOVPN_NODE 2>/dev/null
+    $T -F GEOVPN_NODE 2>/dev/null || $T -N GEOVPN_NODE
+    if [ $T = iptables ]; then L=$ALLOW; else L=$ALLOW6; fi
+    for s in $L; do $T -A GEOVPN_NODE -s "$s" -j ACCEPT; done   # ACCEPT, not RETURN: host firewalls (ufw) drop the rest
+    $T -A GEOVPN_NODE -j DROP
+    $T -I INPUT -p tcp --dport 2222 -j GEOVPN_NODE
+  done
+}
+case "$1" in
+  set)
+    read -r cmd v4 v6 extra <<< "$SSH_ORIGINAL_COMMAND"
+    [ "$cmd" = set-msk ] && [ -z "$extra" ] || { echo "denied"; exit 1; }
+    [ "$v6" = - ] && v6=""
+    [[ $v4 =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && { [ -z "$v6" ] || [[ $v6 =~ ^[0-9a-fA-F:]{2,39}$ ]]; } || { echo "bad address"; exit 1; }
+    printf 'ALLOW="%s"\nALLOW6="%s"\n' "$v4" "$v6" >/conf/fw.env
+    apply && echo "ok $v4 ${v6:--}" ;;
+  clear)
+    for T in iptables ip6tables; do $T -D INPUT -p tcp --dport 2222 -j GEOVPN_NODE 2>/dev/null; $T -F GEOVPN_NODE 2>/dev/null; $T -X GEOVPN_NODE 2>/dev/null; done ;;
+  loop)
+    apply; echo "fw: 2222 allowed only from MSK"
+    while :; do
+      sleep 30 & wait $!
+      iptables -C INPUT -p tcp --dport 2222 -j GEOVPN_NODE 2>/dev/null && ip6tables -C INPUT -p tcp --dport 2222 -j GEOVPN_NODE 2>/dev/null || { apply; echo "fw: rules restored"; }
+    done ;;
+esac
 X
-chmod +x /usr/local/bin/geovpn-fw.sh
-cat >/etc/systemd/system/geovpn-fw.service <<'X'
-[Unit]
-Description=GeoVPN firewall rules
-After=network-online.target docker.service
-[Service]
-Type=oneshot
-ExecStart=/usr/local/bin/geovpn-fw.sh
-RemainAfterExit=yes
-[Install]
-WantedBy=multi-user.target
-X
-systemctl daemon-reload
-systemctl enable geovpn-fw >/dev/null 2>&1
-systemctl restart geovpn-fw
-cd /opt/remnanode && docker compose pull -q && docker compose up -d 2>&1 | tail -1
+chmod +x /opt/remnanode/fw/fw.sh
+cd /opt/remnanode && docker compose build -q geovpn-fw && docker compose pull -q remnanode && docker compose up -d 2>&1 | tail -1
+sleep 2; docker exec geovpn-fw iptables -C INPUT -p tcp --dport 2222 -j GEOVPN_NODE
 echo "node installed on $(hostname)"
 """
 
 NODE_REMOVE = r"""
-cd /opt/remnanode 2>/dev/null && docker compose down 2>&1 | tail -1
+cd /opt/remnanode 2>/dev/null && { docker exec geovpn-fw /conf/fw.sh clear 2>/dev/null; docker compose down --rmi local 2>&1 | tail -1; }
 rm -rf /opt/remnanode
+sed -i '/geovpn-portal-fw/d' /root/.ssh/authorized_keys 2>/dev/null
+# older installs: host-level firewall unit
 systemctl disable --now geovpn-fw >/dev/null 2>&1 || true
 for T in iptables ip6tables; do $T -D INPUT -p tcp --dport 2222 -j GEOVPN_NODE 2>/dev/null; $T -F GEOVPN_NODE 2>/dev/null; $T -X GEOVPN_NODE 2>/dev/null; done
-rm -f /usr/local/bin/geovpn-fw.sh /etc/systemd/system/geovpn-fw.service
+rm -f /usr/local/bin/geovpn-fw.sh /usr/local/bin/geovpn-fw-set /etc/systemd/system/geovpn-fw.service
 systemctl daemon-reload
 echo "node removed from $(hostname)"
 """
