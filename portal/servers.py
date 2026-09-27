@@ -18,7 +18,16 @@ FAILS_TO_DOWN, OKS_TO_UP = 2, 2
 PORTAL_KEY = C.P("ssh/geovpn_portal", "/root/.ssh/geovpn_portal")  # restricted key: only updates MSK address in exits' firewall
 
 # the portal key in exits' authorized_keys is forced to run this: it can only set MSK's address in the fw container
-FW_CMD = "docker exec -e SSH_ORIGINAL_COMMAND geovpn-fw /conf/fw.sh set"
+# Every fw container we install carries the label geovpn.msk=<this MSK's key id>: one exit can host nodes of several entry
+# servers (or two of ours), each MSK's key updates exactly its own firewalls.
+def msk_id():
+    import hashlib
+    return hashlib.sha256(portal_pubkey().split()[1].encode()).hexdigest()[:12]
+
+
+def fw_cmd():
+    return (f"for c in $(docker ps -q --filter label=geovpn.msk={msk_id()}); do "
+            "docker exec -e SSH_ORIGINAL_COMMAND $c /conf/fw.sh set || exit 1; done")
 
 STATUS = {}          # id -> {"ok","ms","ip","v4","v6","ts"}
 COUNTERS = {}        # id -> {"fail": n, "ok": n, "up": bool}
@@ -76,10 +85,12 @@ def portal_pubkey():
 
 
 def install_fw_key(c):
-    """On an exit (open paramiko session as root): add the restricted portal key (runs FW_CMD only)."""
-    line = (f'command="{FW_CMD}",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty ' + portal_pubkey())
+    """On an exit (open paramiko session as root): add the restricted portal key (runs fw_cmd only).
+    Only this MSK's own key line is replaced: another entry server may have its own node on the same exit."""
+    key = portal_pubkey()
+    line = (f'command="{fw_cmd()}",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty ' + key)
     _, o, _ = c.exec_command("mkdir -p /root/.ssh && touch /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys"
-                             " && sed -i '/geovpn-portal-fw/d' /root/.ssh/authorized_keys"
+                             f" && sed -i '\\#{key.split()[1]}#d' /root/.ssh/authorized_keys"
                              f" && echo '{line}' >> /root/.ssh/authorized_keys && echo ok", timeout=20)
     return o.read().decode().strip() == "ok"
 
@@ -413,15 +424,18 @@ def job(title, fn, *args):
 
     def log(msg):
         JOBS[jid]["log"].append(f"{C.now_utc().astimezone(dt.timezone(dt.timedelta(hours=3))).strftime('%H:%M:%S')}  {msg}")
+    log.job = JOBS[jid]
 
     def run():
         try:
             fn(log, *args)
             JOBS[jid]["ok"] = True
-            log("Готово.")
+            if not JOBS[jid].get("confirm"):
+                log("Готово.")
         except Exception as e:
             log("ОШИБКА: " + str(e))
-            C.log_error(f"{title}: {e}")
+            if not isinstance(e, C.UserError):     # wrong input / refused action is not a system failure
+                C.log_error(f"{title}: {e}")
             print(traceback.format_exc(), flush=True)
         JOBS[jid]["done"] = True
 
@@ -481,23 +495,44 @@ def tcp_ok(host, port, timeout=5):
         return False
 
 
+NODE_DEFAULTS = {"node_port": 2222, "node_dir": "/opt/remnanode", "node_name": "remnanode", "fw_name": "geovpn-fw"}
+PENDING = {}         # confirm token -> {"f": add form (incl. password, memory only), "sug", "conflicts", "exp"}
+NAME_RX = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{1,39}")
+DIR_RX = re.compile(r"/opt/[A-Za-z0-9][A-Za-z0-9_.-]{0,39}")
+REALITY_PORTS = [443, 8443, 2053, 2083, 2087, 2096, 4443, 10443]
+
+
+def nd(e, k):
+    """Per-exit install parameter (exits added before 2026-09-27 have none -> the old fixed values)."""
+    return e.get(k) or NODE_DEFAULTS[k]
+
+
+def fw_chain(fw_name):
+    return "GEOVPN_NODE" if fw_name == "geovpn-fw" else ("GV_" + re.sub(r"[^A-Za-z0-9]", "_", fw_name).upper())[:28]
+
+
 NODE_INSTALL = r"""
 set -e
-export DEBIAN_FRONTEND=noninteractive
-if ss -ltn | grep -qE '[:.]__PORT__ '; then echo "PORT_BUSY"; exit 17; fi
-command -v docker >/dev/null || (curl -fsSL https://get.docker.com | sh >/dev/null 2>&1)
+export DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1
+for p in __PORT__ __NPORT__; do
+  if ss -Htln | awk '{print $4}' | grep -qE "[:.]$p\$"; then echo "PORT_BUSY $p"; exit 17; fi
+done
+if [ -e __DIR__ ]; then echo "DIR_BUSY __DIR__"; exit 18; fi
+command -v docker >/dev/null || curl -fsSL https://get.docker.com | sh >/var/log/geovpn-docker-install.log 2>&1
+if docker ps -a --format '{{.Names}}' | grep -qxE '__NODE__|__FW__'; then echo "NAME_BUSY"; exit 19; fi
 cat >/etc/sysctl.d/99-geovpn.conf <<'X'
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 X
 sysctl --system >/dev/null 2>&1 || true
-# everything else lives in /opt/remnanode and runs in docker: remnanode + geovpn-fw (node port 2222 only from MSK)
-mkdir -p /opt/remnanode/fw
-cat >/opt/remnanode/docker-compose.yml <<'X'
+# everything else lives in __DIR__ and runs in docker: xray node + firewall of the node API port (only MSK may connect)
+mkdir -p __DIR__/fw
+cat >__DIR__/docker-compose.yml <<'X'
+# geovpn-exit (managed by the GeoVPN portal; remove it from the portal, not by hand)
 services:
   remnanode:
-    container_name: remnanode
-    hostname: remnanode
+    container_name: __NODE__
+    hostname: __NODE__
     image: __IMAGE__
     restart: always
     network_mode: host
@@ -505,11 +540,12 @@ services:
     ulimits:
       nofile: { soft: 1048576, hard: 1048576 }
     environment:
-      - NODE_PORT=2222
+      - NODE_PORT=__NPORT__
       - SECRET_KEY=__SECRET__
     depends_on: [geovpn-fw]
   geovpn-fw:
-    container_name: geovpn-fw
+    container_name: __FW__
+    labels: ["geovpn.msk=__MSKID__"]
     image: geovpn/fw
     build:
       dockerfile_inline: |
@@ -521,22 +557,30 @@ services:
     volumes: ["./fw:/conf"]
     command: ["/conf/fw.sh", "loop"]
 X
-[ -f /opt/remnanode/fw/fw.env ] || printf 'ALLOW="%s"\nALLOW6="%s"\n' "__MSK4__" "__MSK6__" >/opt/remnanode/fw/fw.env
-cat >/opt/remnanode/fw/fw.sh <<'X'
+printf 'ALLOW="%s"\nALLOW6="%s"\nNODE_PORT=%s\nCHAIN=%s\n' "__MSK4__" "__MSK6__" "__NPORT__" "__CHAIN__" >__DIR__/fw/fw.env
+cat >__DIR__/fw/fw.sh <<'X'
 #!/bin/bash
-# geovpn-fw container: node API port 2222 is reachable only from the MSK entry server.
+# geovpn-fw container: the node API port is reachable only from the MSK entry server.
 #   fw.sh loop  - apply rules, re-apply if something (ufw reload, reboot) removed them
 #   fw.sh set   - "set-msk <ipv4> <ipv6|->" from the restricted portal SSH key (SSH_ORIGINAL_COMMAND)
 #   fw.sh clear - remove the rules (node removal)
+. /conf/fw.env
 apply() {
   . /conf/fw.env
   for T in iptables ip6tables; do
-    $T -D INPUT -p tcp --dport 2222 -j GEOVPN_NODE 2>/dev/null
-    $T -F GEOVPN_NODE 2>/dev/null || $T -N GEOVPN_NODE
+    $T -D INPUT -p tcp --dport "$NODE_PORT" -j "$CHAIN" 2>/dev/null
+    $T -F "$CHAIN" 2>/dev/null || $T -N "$CHAIN"
     if [ $T = iptables ]; then L=$ALLOW; else L=$ALLOW6; fi
-    for s in $L; do $T -A GEOVPN_NODE -s "$s" -j ACCEPT; done   # ACCEPT, not RETURN: host firewalls (ufw) drop the rest
-    $T -A GEOVPN_NODE -j DROP
-    $T -I INPUT -p tcp --dport 2222 -j GEOVPN_NODE
+    for s in $L; do $T -A "$CHAIN" -s "$s" -j ACCEPT; done   # ACCEPT, not RETURN: host firewalls (ufw) drop the rest
+    $T -A "$CHAIN" -j DROP
+    $T -I INPUT -p tcp --dport "$NODE_PORT" -j "$CHAIN"
+  done
+}
+in_place() {  # our jump exists in both families and comes before ufw's chains (ufw enable/reload puts them first)
+  for T in iptables ip6tables; do
+    r=$($T -S INPUT | grep -n -- "--dport $NODE_PORT -j $CHAIN" | head -1 | cut -d: -f1)
+    u=$($T -S INPUT | grep -n -- "-j ufw" | head -1 | cut -d: -f1)
+    [ -n "$r" ] && { [ -z "$u" ] || [ "$r" -lt "$u" ]; } || return 1
   done
 }
 case "$1" in
@@ -545,35 +589,114 @@ case "$1" in
     [ "$cmd" = set-msk ] && [ -z "$extra" ] || { echo "denied"; exit 1; }
     [ "$v6" = - ] && v6=""
     [[ $v4 =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && { [ -z "$v6" ] || [[ $v6 =~ ^[0-9a-fA-F:]{2,39}$ ]]; } || { echo "bad address"; exit 1; }
-    printf 'ALLOW="%s"\nALLOW6="%s"\n' "$v4" "$v6" >/conf/fw.env
+    printf 'ALLOW="%s"\nALLOW6="%s"\nNODE_PORT=%s\nCHAIN=%s\n' "$v4" "$v6" "$NODE_PORT" "$CHAIN" >/conf/fw.env
     apply && echo "ok $v4 ${v6:--}" ;;
   clear)
-    for T in iptables ip6tables; do $T -D INPUT -p tcp --dport 2222 -j GEOVPN_NODE 2>/dev/null; $T -F GEOVPN_NODE 2>/dev/null; $T -X GEOVPN_NODE 2>/dev/null; done ;;
+    for T in iptables ip6tables; do $T -D INPUT -p tcp --dport "$NODE_PORT" -j "$CHAIN" 2>/dev/null; $T -F "$CHAIN" 2>/dev/null; $T -X "$CHAIN" 2>/dev/null; done ;;
   loop)
-    apply; echo "fw: 2222 allowed only from MSK"
+    apply; echo "fw: port $NODE_PORT allowed only from MSK"
     while :; do
       sleep 30 & wait $!
-      iptables -C INPUT -p tcp --dport 2222 -j GEOVPN_NODE 2>/dev/null && ip6tables -C INPUT -p tcp --dport 2222 -j GEOVPN_NODE 2>/dev/null || { apply; echo "fw: rules restored"; }
+      in_place || { apply; echo "fw: rules restored"; }
     done ;;
 esac
 X
-chmod +x /opt/remnanode/fw/fw.sh
-cd /opt/remnanode && docker compose build -q geovpn-fw && docker compose pull -q remnanode && docker compose up -d 2>&1 | tail -1
-sleep 2; docker exec geovpn-fw iptables -C INPUT -p tcp --dport 2222 -j GEOVPN_NODE
-echo "node installed on $(hostname)"
+chmod +x __DIR__/fw/fw.sh
+# host firewall (ufw) would drop the Reality port: open it, and remember that we did (removal closes only what we opened)
+if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
+  if ! ufw status | grep -qE "^__PORT__(/tcp)? "; then ufw allow __PORT__/tcp >/dev/null && touch __DIR__/.ufw-opened && echo "ufw: opened __PORT__/tcp"; fi
+fi
+cd __DIR__ && docker compose build -q geovpn-fw && docker compose pull -q remnanode && docker compose up -d 2>&1 | tail -1
+sleep 2; docker exec __FW__ iptables -C INPUT -p tcp --dport __NPORT__ -j __CHAIN__
+echo "node installed on $(hostname) in __DIR__"
 """
 
 NODE_REMOVE = r"""
-cd /opt/remnanode 2>/dev/null && { docker exec geovpn-fw /conf/fw.sh clear 2>/dev/null; docker compose down --rmi local 2>&1 | tail -1; }
-rm -rf /opt/remnanode
-sed -i '/geovpn-portal-fw/d' /root/.ssh/authorized_keys 2>/dev/null
-# older installs: host-level firewall unit
-systemctl disable --now geovpn-fw >/dev/null 2>&1 || true
-for T in iptables ip6tables; do $T -D INPUT -p tcp --dport 2222 -j GEOVPN_NODE 2>/dev/null; $T -F GEOVPN_NODE 2>/dev/null; $T -X GEOVPN_NODE 2>/dev/null; done
-rm -f /usr/local/bin/geovpn-fw.sh /usr/local/bin/geovpn-fw-set /etc/systemd/system/geovpn-fw.service
-systemctl daemon-reload
+D=__DIR__
+if [ -f $D/docker-compose.yml ] && grep -qE '^# geovpn-exit|geovpn-fw|remnawave/node' $D/docker-compose.yml; then
+  docker exec __FW__ /conf/fw.sh clear 2>/dev/null
+  [ -f $D/.ufw-opened ] && ufw delete allow __PORT__/tcp >/dev/null 2>&1 && echo "ufw: closed __PORT__/tcp"
+  cd $D && docker compose down --rmi local 2>&1 | tail -1
+  cd / && rm -rf $D
+else
+  echo "в $D нет установки GeoVPN — ничего не удаляю"
+fi
+# the portal key stays while this MSK still has other nodes here
+docker ps -aq --filter label=geovpn.msk=__MSKID__ 2>/dev/null | grep -q . || sed -i '\#__KEY__#d' /root/.ssh/authorized_keys 2>/dev/null
+# older installs (before 2026-09-27): host-level firewall unit
+if [ -f /etc/systemd/system/geovpn-fw.service ]; then
+  systemctl disable --now geovpn-fw >/dev/null 2>&1 || true
+  for T in iptables ip6tables; do $T -D INPUT -p tcp --dport 2222 -j GEOVPN_NODE 2>/dev/null; $T -F GEOVPN_NODE 2>/dev/null; $T -X GEOVPN_NODE 2>/dev/null; done
+  rm -f /usr/local/bin/geovpn-fw.sh /usr/local/bin/geovpn-fw-set /etc/systemd/system/geovpn-fw.service
+  systemctl daemon-reload
+fi
 echo "node removed from $(hostname)"
 """
+
+# read-only look at the server before installing: busy TCP ports (+ process), container names, /opt, our old installs
+PREFLIGHT = r"""
+echo "DOCKER=$(command -v docker >/dev/null 2>&1 && echo 1 || echo 0)"
+echo "PORTS=$(ss -Htlnp 2>/dev/null | awk '{n=split($4,a,":"); m="?"; if (match($0,/\("[^"]+"/)) m=substr($0,RSTART+2,RLENGTH-3); print a[n]":"m}' | sort -u | tr '\n' ' ')"
+echo "NAMES=$(command -v docker >/dev/null 2>&1 && docker ps -a --format '{{.Names}}' | tr '\n' ' ')"
+echo "OPT=$(ls -1 /opt 2>/dev/null | tr '\n' ' ')"
+echo "OURS=$(for d in /opt/*/; do grep -qsE '^# geovpn-exit|geovpn-fw|remnawave/node' ${d}docker-compose.yml && printf '%s ' ${d%/}; done)"
+echo "UFW=$(command -v ufw >/dev/null && ufw status 2>/dev/null | head -1)"
+"""
+
+
+def preflight(c, want, sshport=22):
+    """Check the wanted ports / container names / directory on the server. -> (conflicts, suggestions, info)"""
+    import shlex
+    _, o, _ = c.exec_command("bash -c " + shlex.quote(PREFLIGHT), timeout=60)
+    info = {}
+    for line in o.read().decode(errors="replace").splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            info[k.strip()] = v.strip()
+    ports = {}
+    for item in info.get("PORTS", "").split():
+        p, _, proc = item.partition(":")
+        if p.isdigit():
+            ports.setdefault(int(p), proc)
+    names = set(info.get("NAMES", "").split())
+    used_dirs = {"/opt/" + x for x in info.get("OPT", "").split()}
+    ours = set(info.get("OURS", "").split())
+    reserved = {sshport, 22, 80}
+    conflicts, sug = [], dict(want)
+
+    def busy(p):
+        return p in ports or p in reserved
+
+    def who(p):
+        return f"занят процессом «{ports[p]}»" if p in ports else "зарезервирован (SSH/HTTP)"
+
+    if busy(want["port"]):
+        conflicts.append(f"Порт Reality {want['port']}/tcp {who(want['port'])}")
+    if busy(want["node_port"]):
+        conflicts.append(f"Порт управления нодой {want['node_port']}/tcp {who(want['node_port'])}")
+    if want["port"] == want["node_port"]:
+        conflicts.append("Порт Reality и порт управления совпадают")
+    free = lambda p: not busy(p)
+    if busy(want["port"]) or want["port"] == want["node_port"]:
+        sug["port"] = next(p for p in REALITY_PORTS + list(range(20443, 65000, 1000)) if free(p) and p != want["node_port"])
+    if busy(want["node_port"]):
+        sug["node_port"] = next(p for p in range(2222, 2300) if free(p) and p != sug["port"])
+    for key, label in (("node_name", "Контейнер ноды"), ("fw_name", "Контейнер файрвола")):
+        if want[key] in names:
+            conflicts.append(f"{label} «{want[key]}» уже есть на сервере")
+    if want["node_name"] == want["fw_name"]:
+        conflicts.append("Имена контейнеров ноды и файрвола совпадают")
+    if want["node_dir"] in used_dirs:
+        conflicts.append(f"Папка {want['node_dir']} уже существует"
+                         + (" — там прежняя установка GeoVPN (возможно, от другого входного сервера)" if want["node_dir"] in ours else ""))
+    if want["node_name"] in names or want["fw_name"] in names or want["node_name"] == want["fw_name"] or want["node_dir"] in used_dirs:
+        for k in range(1, 100):
+            base = "geovpn-node" + ("" if k == 1 else f"-{k}")
+            n_, f_, d_ = base, base + "-fw", "/opt/" + base
+            if n_ not in names and f_ not in names and d_ not in used_dirs:
+                sug.update(node_name=n_, fw_name=f_, node_dir=d_)
+                break
+    return conflicts, sug, {"docker": info.get("DOCKER") == "1", "ufw": "active" in info.get("UFW", ""), "ours": sorted(ours)}
 
 
 def node_image():
@@ -582,6 +705,34 @@ def node_image():
         return os.environ["NODE_IMAGE"]
     t = open("/opt/remnanode/docker-compose.yml").read()
     return re.search(r"image:\s*(\S+)", t).group(1)
+
+
+def install_params(f):
+    """Validated port / container names / directory from the add (or confirm) form."""
+    w = {}
+    for k, default in (("port", 443), ("node_port", NODE_DEFAULTS["node_port"])):
+        try:
+            w[k] = int(f.get(k) or default)
+        except ValueError:
+            raise C.UserError(f"некорректный порт: {f.get(k)}")
+        if not 1 <= w[k] <= 65535:
+            raise C.UserError(f"некорректный порт: {w[k]}")
+    for k in ("node_name", "fw_name"):
+        w[k] = (f.get(k) or NODE_DEFAULTS[k]).strip()
+        if not NAME_RX.fullmatch(w[k]):
+            raise C.UserError(f"некорректное имя контейнера: {w[k]} (латиница, цифры, - _ .)")
+    w["node_dir"] = (f.get("node_dir") or NODE_DEFAULTS["node_dir"]).strip().rstrip("/")
+    if not DIR_RX.fullmatch(w["node_dir"]):
+        raise C.UserError(f"папка установки должна быть вида /opt/имя, а не {w['node_dir']}")
+    return w
+
+
+def same_server(db, ip4, ip6):
+    """Name of an exit already added with one of these addresses (a panel can't have two nodes on one address)."""
+    for x in db.get("exits", {}).values():
+        if (ip4 and ip4 == x.get("ip4")) or (ip6 and ip6 == x.get("ip6")):
+            return x["name"]
+    return None
 
 
 def do_add(log, f):
@@ -599,24 +750,35 @@ def do_add(log, f):
             pass
     ip6 = ip6_try[0] if ip6_try else ""
     prio, sni, pw = int(f.get("priority") or 10), f.get("sni") or SNI_CHOICES[0], f.get("password", "")
-    sshport, port = int(f.get("sshport") or 22), int(f.get("port") or 443)
+    sshport = int(f.get("sshport") or 22)
+    w = install_params(f)
+    port = w["port"]
     if not name or not (ip4 or ip6) or not pw:
-        raise RuntimeError("Нужны название, корректный IPv4 или IPv6-адрес сервера и root-пароль "
+        raise C.UserError("Нужны название, корректный IPv4 или IPv6-адрес сервера и root-пароль "
                            "(в поле IPv6 — адрес сервера, например 2a12:…::2, а не подсеть /48)")
     db = C.load_db()
     eid = re.sub(r"[^a-z0-9]", "", C.slugify(name))[:8] or "exit"
     base, n = eid, 2
     while eid in db.get("exits", {}):
         eid, n = f"{base}{n}", n + 1
+    dup = same_server(db, ip4, ip6 if ip6_try and valid_ip(ip6, 6) else "")
+    if dup:
+        raise C.UserError(f"этот сервер уже добавлен как «{dup}». Для другого входного сервера (или чужого VPN) на нём "
+                           "ограничений нет — но один вход может держать на сервере только одну свою ноду")
     created = {}
+    c = None
     try:
-        c, errs = None, []
-        for target in ([ip4] if ip4 else []) + ip6_try:
+        errs = []
+        targets = ([ip4] if ip4 else []) + ip6_try
+        if f.get("_ssh") in targets:             # confirm step: go straight to the address that answered last time
+            targets.remove(f["_ssh"]); targets.insert(0, f["_ssh"])
+        for target in targets:
             log(f"Подключаюсь по SSH к {target}…")
             try:
                 c = ssh_connect(target, sshport, pw)
                 if ":" in target:
                     ip6 = target
+                ssh_target = target
                 break
             except Exception as ex:
                 errs.append(f"{target}: {ex}")
@@ -630,44 +792,66 @@ def do_add(log, f):
             ip6 = d6
         if not ip4 and valid_ip(d4, 4) and not d4.startswith(("10.", "192.168.", "172.")):
             ip4 = d4
-        log("SSH: подключено. Генерирую ключи Reality…")
+        dup = same_server(C.load_db(), ip4, ip6)
+        if dup:
+            raise C.UserError(f"этот сервер уже добавлен как «{dup}» (один вход может держать на сервере только одну свою ноду)")
+        log("SSH: подключено. Проверяю, что порты, имена контейнеров и папка на сервере свободны…")
+        conflicts, sug, pf = preflight(c, w, sshport)
+        if pf["docker"]:
+            log("  Docker на сервере уже есть — будет использован он, остальные контейнеры не затрагиваются.")
+        if conflicts:
+            for x in conflicts:
+                log("  занято: " + x)
+            token = secrets.token_urlsafe(16)
+            PENDING[token] = {"f": {**f, "ip4": ip4, "ip6": ip6, "_ssh": ssh_target}, "sug": sug, "conflicts": conflicts, "exp": time.time() + 900}
+            log.job["confirm"] = token
+            log("На сервере ничего не изменено. Проверьте предложенные значения ниже и подтвердите установку.")
+            return
+        log("  всё свободно." + (" На сервере включён ufw — порт Reality будет в нём открыт." if pf["ufw"] else ""))
+        log("Генерирую ключи Reality…")
         kp = C.rw("GET", "/api/system/tools/x25519/generate")["keypairs"][0]
         e = {"name": name, "cc": cc, "host": host, "ip4": ip4, "ip6": ip6, "port": port, "sni": sni,
              "priv": kp["privateKey"], "pub": kp["publicKey"], "sid": secrets.token_hex(8), "priority": prio,
              "enabled": True, "mon_port": max([x["mon_port"] for x in db["exits"].values()] + [10809]) + 1,
+             "node_port": w["node_port"], "node_dir": w["node_dir"], "node_name": w["node_name"], "fw_name": w["fw_name"],
              "created": C.now_utc().isoformat()}
         if e["mon_port"] in (10803, 10808):
             e["mon_port"] = 10820
+        nport = w["node_port"]
         log("Создаю профиль и ноду в Remnawave…")
         prof = C.rw("POST", "/api/config-profiles", {"name": f"EXIT-{eid.upper()}", "config": exit_profile(eid, e)})
         created["profile"] = e["profile_uuid"] = prof["uuid"]
-        node = C.rw("POST", "/api/nodes", {"name": f"EXIT-{eid.upper()}", "address": ip4 or f"[{ip6}]", "port": 2222,
+        node = C.rw("POST", "/api/nodes", {"name": f"EXIT-{eid.upper()}", "address": ip4 or f"[{ip6}]", "port": nport,
                                            "countryCode": cc or "XX",
                                            "configProfile": {"activeConfigProfileUuid": prof["uuid"],
                                                              "activeInbounds": [i["uuid"] for i in prof["inbounds"]]}})
         created["node"] = e["node_uuid"] = node["uuid"]
         secret = C.rw("GET", "/api/keygen")["secretKey"]
-        log("Устанавливаю Docker и ноду на сервер (1–3 минуты)…")
+        log(f"Устанавливаю ноду в {w['node_dir']} (контейнеры {w['node_name']}, {w['fw_name']}; 1–3 минуты)…")
         script = (NODE_INSTALL.replace("__IMAGE__", node_image()).replace("__SECRET__", secret)
-                  .replace("__MSK4__", msk_addrs(db)[0]).replace("__MSK6__", msk_addrs(db)[1]).replace("__PORT__", str(port)))
+                  .replace("__MSK4__", msk_addrs(db)[0]).replace("__MSK6__", msk_addrs(db)[1])
+                  .replace("__PORT__", str(port)).replace("__NPORT__", str(nport)).replace("__DIR__", w["node_dir"])
+                  .replace("__NODE__", w["node_name"]).replace("__FW__", w["fw_name"]).replace("__CHAIN__", fw_chain(w["fw_name"])).replace("__MSKID__", msk_id()))
         try:
+            created["remote"] = True
             ssh_run(c, script, log)
-            if install_fw_key(c):
-                log("Ключ для автообновления адреса MSK в файрволе установлен.")
         except RuntimeError as ex:
-            if "PORT_BUSY" in str(ex) or "код 17" in str(ex) or "кодом 17" in str(ex):
-                raise RuntimeError(f"порт {port} на сервере уже занят — укажите другой порт Reality")
+            rc = re.search(r"кодом? (\d+)", str(ex))
+            if rc and rc.group(1) in ("17", "18", "19"):
+                created.pop("remote")                # the script stopped before touching anything
+                raise RuntimeError("пока шла установка, порт, имя контейнера или папка на сервере оказались заняты — "
+                                   "добавьте сервер ещё раз, портал предложит свободные значения")
             raise
-        finally:
-            c.close()
+        if install_fw_key(c):
+            log("Ключ для автообновления адреса MSK в файрволе установлен.")
         time.sleep(5)
-        if ip4 and tcp_ok(ip4, 2222):
+        if ip4 and tcp_ok(ip4, nport):
             log("Управление ноды: доступно по IPv4.")
-        elif ip6 and tcp_ok(ip6, 2222):
+        elif ip6 and tcp_ok(ip6, nport):
             log("IPv4 сервера недоступен из РФ — управление и мост пойдут по IPv6.")
             C.rw("PATCH", "/api/nodes", {"uuid": node["uuid"], "address": f"[{ip6}]"})
         else:
-            log("ВНИМАНИЕ: порт управления 2222 недоступен ни по IPv4, ни по IPv6 — проверьте позже в панели Remnawave.")
+            log(f"ВНИМАНИЕ: порт управления {nport} недоступен ни по IPv4, ни по IPv6 — проверьте позже в панели Remnawave.")
         with C.LOCK:
             db = C.load_db()
             db["exits"][eid] = e
@@ -693,8 +877,23 @@ def do_add(log, f):
         if "profile" in created:
             try: C.rw("DELETE", f"/api/config-profiles/{created['profile']}")
             except Exception: pass
-        log("Изменения в Remnawave откатены.")
+        if "node" in created or "profile" in created:
+            log("Изменения в Remnawave откатены.")
+        if created.get("remote") and c:
+            log("Убираю с сервера то, что успело поставиться…")
+            try:
+                ssh_run(c, remove_script(e), log)
+            except Exception as ex2:
+                log(f"  не удалось: {ex2}")
         raise
+    finally:
+        if c:
+            c.close()
+
+
+def remove_script(e):
+    return (NODE_REMOVE.replace("__DIR__", nd(e, "node_dir")).replace("__FW__", nd(e, "fw_name"))
+            .replace("__PORT__", str(e.get("port", 443))).replace("__KEY__", portal_pubkey().split()[1]).replace("__MSKID__", msk_id()))
 
 
 def do_delete(log, eid, pw):
@@ -703,7 +902,7 @@ def do_delete(log, eid, pw):
     if not e:
         raise RuntimeError("сервер не найден")
     if len([1 for x in db["exits"].values() if x.get("enabled")]) <= 1 and e.get("enabled"):
-        raise RuntimeError("нельзя удалить последний включённый выходной сервер")
+        raise C.UserError("нельзя удалить последний включённый выходной сервер")
     with C.LOCK:
         db = C.load_db()
         db["exits"].pop(eid)
@@ -720,8 +919,9 @@ def do_delete(log, eid, pw):
         except Exception as ex:
             log(f"  {ex}")
     STATUS.pop(eid, None); COUNTERS.pop(eid, None)
+    manual = f"cd {nd(e, 'node_dir')} && docker compose down && rm -rf {nd(e, 'node_dir')}"
     if pw:
-        log("Удаляю ноду с самого сервера по SSH…")
+        log(f"Удаляю ноду с самого сервера по SSH ({nd(e, 'node_dir')})…")
         c = None
         for h in (e.get("ip4"), e.get("ip6")):
             if not h:
@@ -732,12 +932,12 @@ def do_delete(log, eid, pw):
             except Exception as ex:
                 log(f"  {h}: {ex}")
         if c:
-            ssh_run(c, NODE_REMOVE, log)
+            ssh_run(c, remove_script(e), log)
             c.close()
         else:
-            log("  не удалось подключиться — остановите контейнер remnanode на сервере вручную.")
+            log(f"  не удалось подключиться — удалите на сервере вручную: {manual}")
     else:
-        log("Пароль не указан: на самом сервере контейнер remnanode остался. Остановите его: cd /opt/remnanode && docker compose down")
+        log(f"Пароль не указан: на самом сервере нода осталась. Удалите её вручную: {manual}")
 
 
 def update_address(eid, form):
@@ -754,7 +954,8 @@ def update_address(eid, form):
         raise RuntimeError(f"некорректный IPv6: {ip6}")
     if not (ip4 or cand6):
         raise RuntimeError("укажите новый IPv4 и/или IPv6")
-    ip6 = next((a for a in cand6 if tcp_ok(a, 2222)), cand6[0] if cand6 else "")
+    np_ = nd(C.load_db()["exits"].get(eid) or {}, "node_port")
+    ip6 = next((a for a in cand6 if tcp_ok(a, np_)), cand6[0] if cand6 else "")
     with C.LOCK:
         db = C.load_db()
         e = db["exits"].get(eid)
@@ -764,9 +965,9 @@ def update_address(eid, form):
         e["ip4"], e["ip6"], e["host"] = ip4, ip6, host
         event(db, f"{e['name']}: новый адрес {ip4 or '—'} / {ip6 or '—'} (был {old})")
         C.save_db(db)
-    if ip4 and tcp_ok(ip4, 2222):
+    if ip4 and tcp_ok(ip4, np_):
         addr, how = ip4, "по IPv4"
-    elif ip6 and tcp_ok(ip6, 2222):
+    elif ip6 and tcp_ok(ip6, np_):
         addr, how = f"[{ip6}]", "по IPv6"
     else:
         addr, how = (ip4 or f"[{ip6}]"), None
@@ -778,7 +979,7 @@ def update_address(eid, form):
     STATUS.pop(eid, None); COUNTERS.pop(eid, None)
     if how:
         return f"Адрес обновлён, управление нодой доступно {how}. Канал проверится в течение минуты."
-    return ("Адрес сохранён, но порт управления 2222 по новым адресам недоступен с MSK: проверьте адрес "
+    return (f"Адрес сохранён, но порт управления {np_} по новым адресам недоступен с MSK: проверьте адрес "
             "и что на сервере в файрволе разрешён текущий адрес MSK.")
 
 
@@ -903,9 +1104,12 @@ def render(msg=None, err=None, jid=None, readonly=False):
     jobhtml, refresh = "", ""
     if jid and jid in JOBS:
         j = JOBS[jid]
-        state_ = "выполняется…" if not j["done"] else ("успешно" if j["ok"] else "с ошибкой")
+        pend = PENDING.get(j.get("confirm") or "")
+        state_ = ("выполняется…" if not j["done"] else "нужно подтверждение" if pend
+                  else "остановлено до подтверждения" if j.get("confirm") else "успешно" if j["ok"] else "с ошибкой")
         jobhtml = (f'<div class="card"><h2>{esc(j["title"])} — {state_}</h2>'
-                   f'<code style="max-height:none;white-space:pre-wrap">{esc(chr(10).join(j["log"]) or "…")}</code></div>')
+                   f'<code style="max-height:none;white-space:pre-wrap">{esc(chr(10).join(j["log"]) or "…")}</code>'
+                   + (confirm_form(j["confirm"], pend) if pend and not readonly else "") + '</div>')
         if not j["done"]:
             refresh = '<meta http-equiv="refresh" content="3">'
     alert = f'<div class="card ok">{esc(msg)}</div>' if msg else ""
@@ -974,6 +1178,28 @@ def render(msg=None, err=None, jid=None, readonly=False):
 
 
 # ---------------------------------------------------------------- HTTP handlers (called from app.H)
+def confirm_form(token, pend):
+    esc, sg = C.esc, pend["sug"]
+    fld = lambda k, label, hint: (f'<label>{label}<input type="text" name="{k}" value="{esc(str(sg[k]))}" required>'
+                                  f'<span class="mut" style="font-size:.8rem">{hint}</span></label>')
+    return f"""<form method="post" action="/admin/servers/add-confirm" style="margin-top:14px">
+<input type="hidden" name="token" value="{esc(token)}">
+<p><b>На сервере занято:</b></p><ul>{"".join(f"<li>{esc(x)}</li>" for x in pend["conflicts"])}</ul>
+<p>Портал подобрал свободные значения — можно оставить их или ввести свои:</p>
+<div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(210px,1fr))">
+{fld("port", "Порт Reality (tcp)", "на него подключается MSK")}
+{fld("node_port", "Порт управления нодой (tcp)", "открыт только для MSK")}
+{fld("node_name", "Имя контейнера ноды", "латиница, цифры, - _ .")}
+{fld("fw_name", "Имя контейнера файрвола", "латиница, цифры, - _ .")}
+{fld("node_dir", "Папка установки", "только /opt/имя")}
+</div>
+<button class="btn" style="margin-top:14px">Установить с этими значениями</button>
+<a class="inline" href="/admin/servers" style="margin-left:12px">отмена</a>
+<p class="note">Существующие контейнеры и программы на сервере не затрагиваются. Значения проверятся ещё раз перед установкой;
+если что-то снова окажется занято — портал предложит другое. Форма действует 15 минут, пароль хранится только в памяти до подтверждения.</p>
+</form>"""
+
+
 def handle_get(h, path, q, readonly=False):
     if path in ("/admin/servers", "/admin/servers/"):
         return h.send(200, render(q.get("msg", [None])[0], q.get("err", [None])[0], q.get("job", [None])[0], readonly))
@@ -984,6 +1210,17 @@ def handle_post(h, path, form):
     f = {k: v[0] for k, v in form.items()}
     if path == "/admin/servers/add":
         jid = job(f"Добавление сервера «{f.get('name', '')}»", do_add, f)
+        return h.redirect(f"/admin/servers?job={jid}")
+    if path == "/admin/servers/add-confirm":
+        now = time.time()
+        for k in [k for k, v in PENDING.items() if v["exp"] < now]:
+            PENDING.pop(k, None)
+        p = PENDING.pop(f.get("token", ""), None)
+        if not p:
+            return h.redirect("/admin/servers?err=" + C.quote("Подтверждение устарело — добавьте сервер заново"))
+        ff = dict(p["f"])
+        ff.update({k: f[k].strip() for k in ("port", "node_port", "node_name", "fw_name", "node_dir") if f.get(k, "").strip()})
+        jid = job(f"Добавление сервера «{ff.get('name', '')}»", do_add, ff)
         return h.redirect(f"/admin/servers?job={jid}")
     if path == "/admin/servers/msk-push":
         def do_push(log):
