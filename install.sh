@@ -179,6 +179,7 @@ for i in $(seq 1 30); do ss -ltn "sport = :443" | grep -q LISTEN && break; sleep
 ss -ltn "sport = :443" | grep -q LISTEN && c_ok "   xray слушает 443 (Reality + Hysteria2)" || c_warn "xray пока не слушает 443 — см. docker logs remnanode"
 sleep 15
 docker exec geovpn-portal geovpn apply-direct >/dev/null && c_ok "   профиль Happ, шаблоны подписок, список «мимо VPN» — применены"
+docker exec geovpn-portal geovpn ensure-node >/dev/null || true   # the profile update above may have made the panel disable it
 (docker exec geovpn-portal bash /app/scripts/apps-update.sh >/dev/null 2>&1 &)   # installers mirror, in background
 
 # ------------------------------------------------------------------ result

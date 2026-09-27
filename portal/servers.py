@@ -300,6 +300,21 @@ def apply(db, plan=None):
                 inbounds += [i["uuid"] for i in p.get("inbounds", [])]
         C.rw("PATCH", "/api/internal-squads", {"uuid": st["squads"]["bridge"], "inbounds": inbounds})
         db["balancer"]["plan"] = plan
+        keep_enabled(st["nodes"]["MSK"])
+
+
+def keep_enabled(node_uuid, wait=8):
+    """A profile update gets new inbound ids; the panel restarts the node at once and, seeing the node's old ids,
+    logs 'No active inbounds found ... disabling' - our PATCH with the new ids comes a moment later but the node
+    stays disabled (prod, 2026-09-27). Watch it for a few seconds and switch it back on."""
+    for _ in range(wait // 2):
+        time.sleep(2)
+        n = next((x for x in C.rw("GET", "/api/nodes") if x["uuid"] == node_uuid), None)
+        if n and n.get("isDisabled"):
+            C.rw("POST", f"/api/nodes/{node_uuid}/actions/enable", {})
+            print(f"node {n['name']} was disabled by the panel after a profile update - enabled", flush=True)
+            return True
+    return False
 
 
 # ---------------------------------------------------------------- probing / watchdog
@@ -365,6 +380,36 @@ def names(db, ids):
     return ", ".join(db["exits"][i]["name"] for i in ids if i in db["exits"]) or "—"
 
 
+def heal_panel(nodes):
+    """Self-repair of the panel state (both seen on prod 2026-09-27):
+    - Remnawave disables a node after a few failed connects (e.g. while xray restarts) and never re-enables it.
+      A disabled MSK node = empty subscriptions and no route to the exits. The portal itself never disables nodes.
+    - an interrupted add may leave an EXIT-* node/profile the portal doesn't know; it blocks re-adding that server.
+    Never runs while a server is being added/removed (its node/profile exist before the portal DB knows them)."""
+    if starting_up():
+        return
+    db = C.load_db()
+    known_n = {e.get("node_uuid") for e in db["exits"].values()}
+    known_p = {e.get("profile_uuid") for e in db["exits"].values()}
+    for n in nodes:
+        if n.get("isDisabled") and (n["name"] == "MSK" or n["uuid"] in known_n):
+            C.rw("POST", f"/api/nodes/{n['uuid']}/actions/enable", {})
+            n["_healed"] = True     # skip the "not connected" alarm this tick: it is reconnecting
+            C.log_error(f"Панель Remnawave отключила ноду {n['name']} — портал включил её обратно")
+    for n in nodes:
+        if n["name"].startswith("EXIT-") and n["uuid"] not in known_n:
+            C.rw("DELETE", f"/api/nodes/{n['uuid']}")
+            n["_gone"] = True
+            C.log_error(f"Удалена лишняя нода {n['name']} ({n['address']}) — осталась от прерванного добавления сервера")
+    profs = C.rw("GET", "/api/config-profiles")
+    profs = profs.get("configProfiles", []) if isinstance(profs, dict) else profs
+    for p in profs:
+        if p["name"].startswith("EXIT-") and p["uuid"] not in known_p:
+            C.rw("DELETE", f"/api/config-profiles/{p['uuid']}")
+            C.log_error(f"Удалён лишний профиль {p['name']} — остался от прерванного добавления сервера")
+    nodes[:] = [n for n in nodes if not n.get("_gone")]
+
+
 def watchdog_tick():
     db = C.load_db()
     if seed(db):
@@ -381,8 +426,11 @@ def watchdog_tick():
     quiet = starting_up()
     try:
         # quiet while the portal is starting or a server is being added/removed (its node is not up yet)
-        for n in ([] if quiet else C.rw("GET", "/api/nodes")):
-            if not n.get("isConnected") and not n.get("isDisabled"):
+        nodes = [] if quiet else C.rw("GET", "/api/nodes")
+        if not quiet:
+            heal_panel(nodes)
+        for n in nodes:
+            if not n.get("isConnected") and not n.get("isDisabled") and not n.get("_healed"):
                 C.log_error(f"Нода {n['name']} ({n['address']}) не на связи с панелью: {(n.get('lastStatusMessage') or '')[:160]}")
     except Exception as ex:
         if not quiet:
