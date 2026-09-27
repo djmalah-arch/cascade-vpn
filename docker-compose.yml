@@ -1,0 +1,156 @@
+# Cascade VPN — entry server (RU). Everything runs in containers; state lives in ./data (see install.sh).
+name: geovpn
+
+x-log: &log
+  logging:
+    driver: json-file
+    options: { max-size: 20m, max-file: "3" }
+
+services:
+  # ---------------------------------------------------------------- Remnawave panel (users, subscriptions, xray nodes)
+  remnawave-db:
+    image: postgres:18.4
+    container_name: remnawave-db
+    restart: always
+    shm_size: 256mb
+    env_file: ./data/remnawave.env
+    environment: [TZ=UTC]
+    volumes: [remnawave-db-data:/var/lib/postgresql]
+    networks: [remnawave]
+    healthcheck: { test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"], interval: 3s, timeout: 10s, retries: 20 }
+    <<: *log
+
+  remnawave-redis:
+    image: valkey/valkey:9-alpine
+    container_name: remnawave-redis
+    restart: always
+    command: >
+      valkey-server --save "" --appendonly no --maxmemory-policy noeviction --loglevel warning
+      --unixsocket /var/run/valkey/valkey.sock --unixsocketperm 777 --port 0
+    volumes: [valkey-socket:/var/run/valkey]
+    networks: [remnawave]
+    healthcheck: { test: ["CMD", "valkey-cli", "-s", "/var/run/valkey/valkey.sock", "ping"], interval: 3s, timeout: 3s, retries: 20 }
+    <<: *log
+
+  remnawave:
+    image: ${REMNAWAVE_IMAGE:-remnawave/backend:3}
+    container_name: remnawave
+    restart: always
+    env_file: ./data/remnawave.env
+    volumes: [valkey-socket:/var/run/valkey]
+    ports: ["127.0.0.1:3000:3000"]
+    networks: [remnawave]
+    ulimits: { nofile: { soft: 1048576, hard: 1048576 } }
+    depends_on:
+      remnawave-db: { condition: service_healthy }
+      remnawave-redis: { condition: service_healthy }
+    <<: *log
+
+  # ---------------------------------------------------------------- web: portal, personal pages, subscriptions, panel
+  # listens only on 127.0.0.1:8443 (behind Reality on :443, PROXY protocol) and :80 (ACME + redirect)
+  caddy:
+    image: caddy:2
+    container_name: geovpn-caddy
+    restart: always
+    network_mode: host
+    volumes:
+      - ./data/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./data/caddy:/data
+      - ./data/apps:/srv/app:ro
+    <<: *log
+
+  # ---------------------------------------------------------------- xray (Reality + Hysteria2 on :443), managed by the panel
+  remnanode:
+    image: ${NODE_IMAGE:-remnawave/node@sha256:0cdf386dd49f360fc885bb34bde21132e478e40f0deac62d616086ec0fa9257e}
+    container_name: remnanode
+    restart: always
+    network_mode: host
+    cap_add: [NET_ADMIN]
+    env_file:
+      - { path: ./data/portal/node.env, required: false }   # written by bootstrap
+    ulimits: { nofile: { soft: 1048576, hard: 1048576 } }
+    volumes:
+      - ./data/caddy/caddy/certificates/acme-v02.api.letsencrypt.org-directory:/var/lib/remnawave/configs/xray/ssl:ro
+    <<: *log
+
+  # ---------------------------------------------------------------- AmneziaWG 2.0 (userspace) + bridge into xray
+  awg:
+    build: ./images/awg
+    image: geovpn/awg
+    container_name: geovpn-awg
+    restart: always
+    network_mode: host
+    cap_add: [NET_ADMIN]
+    devices: [/dev/net/tun]
+    volumes:
+      - ./data/awg:/etc/amnezia/amneziawg
+      - awg-run:/var/run/amneziawg
+    <<: *log
+
+  singbox:
+    image: ${SINGBOX_IMAGE:-ghcr.io/sagernet/sing-box:latest}
+    container_name: geovpn-singbox
+    restart: always
+    network_mode: host
+    cap_add: [NET_ADMIN]
+    command: ["run", "-c", "/etc/sing-box/config.json"]
+    volumes: [./config/sing-box.json:/etc/sing-box/config.json:ro]
+    <<: *log
+
+  # ---------------------------------------------------------------- DPI bypass for YouTube (IPv4)
+  zapret:
+    build: ./images/zapret
+    image: geovpn/zapret
+    container_name: geovpn-zapret
+    restart: always
+    network_mode: host
+    cap_add: [NET_ADMIN, NET_RAW]
+    volumes: [./data/zapret:/opt/zapret/config.d]
+    <<: *log
+
+  # ---------------------------------------------------------------- Telegram proxy
+  mtproxy:
+    build: ./images/mtproxy
+    image: geovpn/mtproxy
+    container_name: geovpn-mtproxy
+    restart: always
+    network_mode: host
+    volumes: [./data/mtproxy:/etc/geovpn/mtproxy:ro]
+    <<: *log
+
+  # ---------------------------------------------------------------- portal (admin, pages, balancer watchdog, backups...)
+  portal:
+    build: { context: ., dockerfile: portal/Dockerfile }
+    image: geovpn/portal
+    container_name: geovpn-portal
+    restart: always
+    network_mode: host
+    cap_add: [NET_ADMIN]
+    environment:
+      - GEOVPN_DATA=/data
+      - NODE_IMAGE=${NODE_IMAGE:-remnawave/node@sha256:0cdf386dd49f360fc885bb34bde21132e478e40f0deac62d616086ec0fa9257e}
+      - CADDY_DATA=/caddy-data
+      - NODE_GW=172.28.0.1
+    volumes:
+      - ./data/portal:/data
+      - ./data/awg:/etc/amnezia/amneziawg
+      - awg-run:/var/run/amneziawg
+      - ./data/mtproxy:/etc/geovpn/mtproxy
+      - ./data/apps:/opt/geovpn-portal/app
+      - ./data/caddy:/caddy-data:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    <<: *log
+
+volumes:
+  remnawave-db-data:
+  valkey-socket:
+  awg-run:
+
+networks:
+  remnawave:
+    name: remnawave-network
+    enable_ipv6: true
+    ipam:
+      config:
+        - { subnet: 172.28.0.0/16, gateway: 172.28.0.1 }
+        - { subnet: "fd00:5eed:2::/64" }

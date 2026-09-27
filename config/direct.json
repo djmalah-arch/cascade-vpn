@@ -1,0 +1,20 @@
+{
+ "_comment": "Traffic that must NOT go through the VPN (games etc). Edit, then run: geovpn-apply-direct",
+ "domains": [
+  "steampowered.com", "steamcommunity.com", "steamcontent.com", "steamserver.net", "steamstatic.com",
+  "steamusercontent.com", "steam-chat.com", "steamgames.com", "valvesoftware.com", "counter-strike.net",
+  "stalcraft.net", "stalzone.com", "stalzone.net", "exbo.net"
+ ],
+ "geosite": ["steam"],
+ "ips": [
+  "103.10.124.0/23", "103.28.54.0/24", "146.66.152.0/24", "146.66.155.0/24", "155.133.224.0/19",
+  "162.254.192.0/21", "185.25.180.0/24", "185.25.182.0/23", "192.69.96.0/22", "205.196.6.0/24",
+  "208.64.200.0/22", "208.78.164.0/22", "45.121.184.0/24",
+  "2404:3fc0::/44", "2602:801:f000::/44", "2a01:bc80::/44",
+  "138.249.102.0/23"
+ ],
+ "_sources": {
+  "valve": "RIPEstat announced prefixes AS32590 (Valve), 2026-09-27; CS2/Steam game servers and SDR relays",
+  "exbo": "AS219021 Eksbo Sever LLC (STALZONE/STALCRAFT game servers, RU) + game/launcher domains"
+ }
+}

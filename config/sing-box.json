@@ -1,0 +1,11 @@
+{
+  "log": { "level": "warn" },
+  "inbounds": [
+    { "type": "tproxy", "tag": "awg-in", "listen": "127.0.0.1", "listen_port": 12345, "network": "tcp" },
+    { "type": "tproxy", "tag": "awg-in-udp", "listen": "127.0.0.1", "listen_port": 12345, "network": "udp" }
+  ],
+  "outbounds": [
+    { "type": "socks", "tag": "to-xray", "server": "127.0.0.1", "server_port": 10808, "version": "5" }
+  ],
+  "route": { "final": "to-xray" }
+}
