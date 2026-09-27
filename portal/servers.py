@@ -362,7 +362,9 @@ def watchdog_tick():
     except Exception as ex:
         print("msk ip check:", repr(ex), flush=True)
     try:
-        for n in C.rw("GET", "/api/nodes"):
+        # quiet while the portal is starting or a server is being added/removed (its node is not up yet)
+        quiet = time.time() - C.STARTED < C.STARTUP_GRACE or any(not j["done"] for j in JOBS.values())
+        for n in ([] if quiet else C.rw("GET", "/api/nodes")):
             if not n.get("isConnected") and not n.get("isDisabled"):
                 C.log_error(f"Нода {n['name']} ({n['address']}) не на связи с панелью: {(n.get('lastStatusMessage') or '')[:160]}")
     except Exception as ex:

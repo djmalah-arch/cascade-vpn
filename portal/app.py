@@ -79,6 +79,8 @@ MTP_CONF = os.environ.get("MTP_CONF", "/etc/geovpn/mtproxy/config.py")
 MTP_METRICS = "http://127.0.0.1:9189/"
 
 LOCK = threading.RLock()
+STARTED = time.time()
+STARTUP_GRACE = 180  # s after portal start: services are still coming up, don't log health alerts
 CACHE = {"users": ([], 0.0), "mon": ({}, 0.0)}
 
 
@@ -634,9 +636,10 @@ def background():
                 CACHE["mon"] = (mon, time.time())
             bad = [k for k, v in mon["services"].items() if v != "active"] + \
                   [f"docker:{k}" for k, v in mon["containers"].items() if not v]
-            if bad:
+            warm = time.time() - STARTED > STARTUP_GRACE
+            if bad and warm:
                 log_error("Службы MSK не работают: " + ", ".join(bad))
-            if not mon.get("youtube"):
+            if not mon.get("youtube") and warm:
                 log_error("YouTube с MSK недоступен (проверь IPv6 и zapret, ADMIN.md 6.4)")
         except Exception as e:
             log_error(f"Фоновая задача портала: {e!r}")
@@ -1275,6 +1278,8 @@ class H(BaseHTTPRequestHandler):
                 hl = "" if m.group(2) == "delete" else f"&new={quote(m.group(1))}" if m.group(2) == "reissue" else ""
                 return self.redirect("/admin?msg=" + quote(msgs[m.group(2)]) + hl)
             return self.not_found()
+        except (BrokenPipeError, ConnectionResetError):
+            return None  # the browser went away before reading the answer - nothing to report
         except Exception as e:
             if not isinstance(e, UserError):
                 log_error(f"Действие в админке ({p}): {e}")
