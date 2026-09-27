@@ -592,11 +592,14 @@ case "$1" in
     printf 'ALLOW="%s"\nALLOW6="%s"\nNODE_PORT=%s\nCHAIN=%s\n' "$v4" "$v6" "$NODE_PORT" "$CHAIN" >/conf/fw.env
     apply && echo "ok $v4 ${v6:--}" ;;
   clear)
+    touch /conf/.removing   # the loop below must not "restore" the rules in its last seconds
     for T in iptables ip6tables; do $T -D INPUT -p tcp --dport "$NODE_PORT" -j "$CHAIN" 2>/dev/null; $T -F "$CHAIN" 2>/dev/null; $T -X "$CHAIN" 2>/dev/null; done ;;
   loop)
+    [ -f /conf/.removing ] && exec sleep infinity
     apply; echo "fw: port $NODE_PORT allowed only from MSK"
     while :; do
       sleep 30 & wait $!
+      [ -f /conf/.removing ] && exec sleep infinity
       in_place || { apply; echo "fw: rules restored"; }
     done ;;
 esac
@@ -857,6 +860,7 @@ def do_add(log, f):
             db["exits"][eid] = e
             event(db, f"Добавлен сервер {name} (приоритет {prio})")
             C.save_db(db)
+        created["db"] = True
         log("Обновляю маршрутизацию MSK…")
         apply(db, compute_plan(db))
         with C.LOCK:
@@ -879,6 +883,16 @@ def do_add(log, f):
             except Exception: pass
         if "node" in created or "profile" in created:
             log("Изменения в Remnawave откатены.")
+        if created.get("db"):
+            with C.LOCK:
+                db = C.load_db()
+                db["exits"].pop(eid, None)
+                event(db, f"Добавление сервера {name} отменено из-за ошибки")
+                C.save_db(db)
+            try:
+                apply(db, compute_plan(db))
+            except Exception as ex2:
+                log(f"  маршрутизация MSK: {ex2}")
         if created.get("remote") and c:
             log("Убираю с сервера то, что успело поставиться…")
             try:
