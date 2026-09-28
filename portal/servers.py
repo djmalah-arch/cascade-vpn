@@ -141,6 +141,86 @@ def dns_a(name):
         return []
 
 
+DNS_CACHE = {}
+HOST_RX = re.compile(r"(?=.{4,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{1,62}")
+COMMON_LABELS = ("exit", "vpn", "node", "srv", "server", "connect", "proxy", "de", "nl", "fi", "at", "us")
+
+
+def norm_host(h):
+    h = (h or "").strip().lower().rstrip(".")
+    return h if HOST_RX.fullmatch(h) else ""
+
+
+def resolve(name, ttl=300):
+    """A and AAAA records of a hostname -> (v4 list, v6 list), cached for a few minutes."""
+    hit = DNS_CACHE.get(name)
+    if hit and hit[0] > time.time():
+        return hit[1]
+    res = []
+    for fam in (socket.AF_INET, socket.AF_INET6):
+        try:
+            res.append(sorted({a[4][0] for a in socket.getaddrinfo(name, None, fam, socket.SOCK_STREAM)}))
+        except OSError:
+            res.append([])
+    DNS_CACHE[name] = (time.time() + ttl, tuple(res))
+    return tuple(res)
+
+
+def remember_host(db, host):
+    """Hostnames ever used for exits: candidates for "which domain points here" after a server is deleted."""
+    if host:
+        kh = db.setdefault("known_hosts", [])
+        if host not in kh:
+            kh.append(host)
+            del kh[:-50]
+
+
+def host_candidates(db):
+    """DNS has no "names pointing to this IP" lookup: guess within the zones we know (our own hostnames,
+    their numbered siblings like geo-srv01 -> geo-srv02..20, and a few typical labels)."""
+    known = {h for h in [norm_host(MSK_DOMAIN)] + [norm_host(e.get("host")) for e in db.get("exits", {}).values()]
+             + [norm_host(h) for h in db.get("known_hosts", [])] if h}
+    cands = set(known)
+    for h in known:
+        label, _, zone = h.partition(".")
+        if "." not in zone:
+            continue
+        m = re.fullmatch(r"(.*?)(\d+)", label)
+        if m:
+            cands |= {f"{m.group(1)}{str(i).zfill(len(m.group(2)))}.{zone}" for i in range(1, 21)}
+        cands |= {f"{x}.{zone}" for x in COMMON_LABELS}
+    return sorted(cands)
+
+
+def names_for(ip, db=None):
+    """Domains (among the guessed candidates) whose A/AAAA point to ip, plus the PTR name if any."""
+    import ipaddress
+    want = ipaddress.ip_address(ip)
+    cands = host_candidates(db or C.load_db())
+    with ThreadPoolExecutor(max_workers=16) as ex:
+        res = dict(zip(cands, ex.map(resolve, cands)))
+    match = [h for h, (v4, v6) in res.items() if any(ipaddress.ip_address(a) == want for a in v4 + v6)]
+    try:
+        ptr = norm_host(socket.gethostbyaddr(ip)[0])
+    except OSError:
+        ptr = ""
+    return {"match": match, "ptr": ptr if ptr and ptr not in match else ""}
+
+
+def lookup(q):
+    """/admin/servers/lookup: ?host= -> its addresses, ?ip= -> domains pointing to it."""
+    if q.get("host"):
+        h = norm_host(q["host"])
+        if not h:
+            return {"error": "некорректный домен"}
+        v4, v6 = resolve(h, ttl=30)
+        return {"host": h, "v4": v4, "v6": v6}
+    ip = (q.get("ip") or "").strip()
+    if valid_ip(ip, 4) or valid_ip(ip, 6):
+        return {"ip": ip, **names_for(ip)}
+    return {"error": "укажите домен или IP"}
+
+
 def exits_sorted(db, only_enabled=False):
     items = [(i, e) for i, e in db.get("exits", {}).items() if e.get("enabled") or not only_enabled]
     return sorted(items, key=lambda kv: (kv[1]["priority"], kv[0]))
@@ -191,15 +271,12 @@ def out_tags(eid, e):
     return tags
 
 
-def dns_mismatch(e):
+def dns_mismatch(e, ttl=300):
     """Hostname set but its A records don't include the exit's IPv4 (stale DNS after an IP change) -> resolved list."""
     host, ip4 = e.get("host"), e.get("ip4")
     if not (host and ip4):
         return None
-    try:
-        addrs = sorted({a[4][0] for a in socket.getaddrinfo(host, None, socket.AF_INET)})
-    except OSError:
-        addrs = []
+    addrs = resolve(host, ttl)[0]
     return None if ip4 in addrs else addrs
 
 
@@ -865,6 +942,16 @@ def do_add(log, f):
     name = " ".join(f["name"].split())[:40]
     cc = (f.get("cc") or "").upper()[:2]
     ip4, ip6, host = f.get("ip4", "").strip(), f.get("ip6", "").strip(), f.get("host", "").strip()
+    if host and not norm_host(host):
+        raise C.UserError(f"некорректный домен: {host}")
+    host = norm_host(host)
+    from_dns = False
+    if host and not (ip4 or ip6):                # only a domain given: take its A/AAAA records
+        d4, d6 = resolve(host, ttl=0)
+        if not (d4 or d6):
+            raise C.UserError(f"домен {host} не резолвится — укажите IPv4 или IPv6 сервера")
+        ip4, ip6, from_dns = (d4[0] if d4 else ""), (d6[0] if d6 else ""), True
+        log(f"Адрес из DNS {host}: {ip4 or '—'} / {ip6 or '—'} (сверю с самим сервером после подключения)")
     ip4 = ip4 if valid_ip(ip4, 4) else ""
     ip6_try = [ip6] if valid_ip(ip6, 6) else []
     if not ip6_try and "/" in ip6:               # "2a12:…::/48" from the hoster panel: try typical host addresses
@@ -880,7 +967,7 @@ def do_add(log, f):
     w = install_params(f)
     port = w["port"]
     if not name or not (ip4 or ip6) or not pw:
-        raise C.UserError("Нужны название, корректный IPv4 или IPv6-адрес сервера и root-пароль "
+        raise C.UserError("Нужны название, домен или корректный IPv4/IPv6-адрес сервера и root-пароль "
                            "(в поле IPv6 — адрес сервера, например 2a12:…::2, а не подсеть /48)")
     db = C.load_db()
     eid = re.sub(r"[^a-z0-9]", "", C.slugify(name))[:8] or "exit"
@@ -910,14 +997,26 @@ def do_add(log, f):
                 errs.append(f"{target}: {ex}")
                 log(f"  не отвечает ({ex})")
         if not c:
-            raise RuntimeError("не удалось подключиться по SSH (" + "; ".join(errs) + "). Если IPv4 сервера "
-                               "заблокирован в РФ, укажите его IPv6-адрес (например 2a12:…::2) — портал подключится по нему")
+            raise RuntimeError("не удалось подключиться по SSH (" + "; ".join(errs) + "). " +
+                               (f"Адрес взят из DNS {host} — если IP сервера недавно сменился, DNS может ещё указывать на "
+                                "старый (обновление до суток): укажите IP вручную. " if from_dns else "") +
+                               "Если IPv4 сервера заблокирован в РФ, укажите его IPv6-адрес (например 2a12:…::2) — портал подключится по нему")
         d4, d6 = detect_addrs(c)
         if d6 and valid_ip(d6, 6) and d6 != ip6:
             log(f"  IPv6 сервера: {d6}" + (f" (в форме было {f.get('ip6')})" if f.get("ip6") else ""))
             ip6 = d6
-        if not ip4 and valid_ip(d4, 4) and not d4.startswith(("10.", "192.168.", "172.")):
+        d4_public = valid_ip(d4, 4) and not d4.startswith(("10.", "192.168.", "172."))
+        if d4_public and d4 != ip4 and (not ip4 or from_dns):
+            if ip4:
+                log(f"  IPv4 сервера: {d4} (DNS {host} указывает на {ip4} — устарел, беру адрес с сервера)")
             ip4 = d4
+        if not host and ip4:
+            found = names_for(ip4)["match"]
+            if len(found) == 1:
+                host = found[0]
+                log(f"  Домен сервера по DNS: {host}")
+            elif found:
+                log(f"  На этот IP указывают домены: {', '.join(found)} — домен не подставлен, укажите его в «Адрес…» при желании")
         dup = same_server(C.load_db(), ip4, ip6)
         if dup:
             raise C.UserError(f"этот сервер уже добавлен как «{dup}» (один вход может держать на сервере только одну свою ноду)")
@@ -929,7 +1028,7 @@ def do_add(log, f):
             for x in conflicts:
                 log("  занято: " + x)
             token = secrets.token_urlsafe(16)
-            PENDING[token] = {"f": {**f, "ip4": ip4, "ip6": ip6, "_ssh": ssh_target}, "sug": sug, "conflicts": conflicts, "exp": time.time() + 900}
+            PENDING[token] = {"f": {**f, "ip4": ip4, "ip6": ip6, "host": host, "_ssh": ssh_target}, "sug": sug, "conflicts": conflicts, "exp": time.time() + 900}
             log.job["confirm"] = token
             log("На сервере ничего не изменено. Проверьте предложенные значения ниже и подтвердите установку.")
             return
@@ -988,10 +1087,11 @@ def do_add(log, f):
         with C.LOCK:
             db = C.load_db()
             db["exits"][eid] = e
+            remember_host(db, host)
             event(db, f"Добавлен сервер {name} (приоритет {prio})")
             C.save_db(db)
         created["db"] = True
-        bad = dns_mismatch(e)
+        bad = dns_mismatch(e, 0)
         if bad is not None:
             log(f"ВНИМАНИЕ: {host} указывает на {', '.join(bad) or 'ничего'}, а не на {ip4} — обновите A-запись (мост MSK всё равно идёт по IP; DNS может обновляться до суток).")
         log("Обновляю маршрутизацию MSK…")
@@ -1091,6 +1191,14 @@ def update_address(eid, form):
     """Exit server got a new IP: store it, point the Remnawave node and the MSK bridge to it. No reinstall."""
     import ipaddress
     ip4, ip6, host = form.get("ip4", "").strip(), form.get("ip6", "").strip(), form.get("host", "").strip()
+    if host and not norm_host(host):
+        raise RuntimeError(f"некорректный домен: {host}")
+    host = norm_host(host)
+    if host and not (ip4 or ip6):                # only a domain: take its current A/AAAA
+        d4, d6 = resolve(host, ttl=0)
+        if not (d4 or d6):
+            raise RuntimeError(f"домен {host} не резолвится — укажите IP")
+        ip4, ip6 = (d4[0] if d4 else ""), (d6[0] if d6 else "")
     if ip4 and not valid_ip(ip4, 4):
         raise RuntimeError(f"некорректный IPv4: {ip4}")
     cand6 = [ip6] if valid_ip(ip6, 6) else []
@@ -1110,6 +1218,7 @@ def update_address(eid, form):
             raise RuntimeError("сервер не найден")
         old = f"{e.get('ip4') or '—'} / {e.get('ip6') or '—'}"
         e["ip4"], e["ip6"], e["host"] = ip4, ip6, host
+        remember_host(db, host)
         event(db, f"{e['name']}: новый адрес {ip4 or '—'} / {ip6 or '—'} (был {old})")
         C.save_db(db)
     if ip4 and tcp_ok(ip4, np_):
@@ -1124,7 +1233,7 @@ def update_address(eid, form):
     with C.LOCK:
         fresh = C.load_db(); fresh["balancer"] = db["balancer"]; C.save_db(fresh)
     STATUS.pop(eid, None); COUNTERS.pop(eid, None)
-    bad = dns_mismatch(e)
+    bad = dns_mismatch(e, 0)
     dns = (f" Внимание: {host} указывает на {', '.join(bad) or 'ничего'}, а не на {ip4} — обновите A-запись "
            "(мост MSK идёт по IP, DNS может обновляться до суток)." if bad is not None else "")
     if how:
@@ -1196,6 +1305,10 @@ def render(msg=None, err=None, jid=None, readonly=False):
         addr = esc(e.get("host") or e.get("ip4") or "")
         if e.get("host") and e.get("ip4"):
             addr += f'<div class="mut">{esc(e["ip4"])}</div>'
+            bad = dns_mismatch(e)
+            if bad is not None:
+                addr += (f'<div class="mut" style="color:#e0a040" title="мост MSK идёт по IP, на работу не влияет; '
+                         f'DNS может обновляться до суток">DNS → {esc(", ".join(bad) or "не резолвится")}</div>')
         if e.get("ip6"):
             addr += f'<div class="mut">{esc(e["ip6"])}</div>'
         toggle = "Вывести из работы" if e.get("enabled") else "Вернуть в работу"
@@ -1213,10 +1326,11 @@ def render(msg=None, err=None, jid=None, readonly=False):
 <td><form method="post" action="/admin/servers/{eid}/update" style="display:inline"><input type="hidden" name="toggle" value="1">
 <button class="btn sm alt">{toggle}</button></form>
 <details style="display:inline-block"><summary class="btn sm alt" style="list-style:none">Адрес…</summary>
-<form method="post" action="/admin/servers/{eid}/address" style="margin-top:8px;min-width:220px">
+<form method="post" action="/admin/servers/{eid}/address" class="addr" style="margin-top:8px;min-width:220px">
 <input type="text" name="ip4" value="{esc(e.get('ip4') or '')}" placeholder="IPv4" style="margin-bottom:6px">
 <input type="text" name="ip6" value="{esc(e.get('ip6') or '')}" placeholder="IPv6 (можно подсеть /48)" style="margin-bottom:6px">
-<input type="text" name="host" value="{esc(e.get('host') or '')}" placeholder="домен (необязательно)" style="margin-bottom:6px">
+<input type="text" name="host" value="{esc(e.get('host') or '')}" placeholder="домен (необязательно)" list="dl-{eid}" style="margin-bottom:6px"><datalist id="dl-{eid}"></datalist>
+<div class="mut lk" style="margin-bottom:6px"></div>
 <button class="btn sm">Сохранить адрес</button>
 <div class="mut">Если хостер сменил IP сервера. Переустановка не нужна.</div></form></details>
 <details style="display:inline-block"><summary class="btn sm danger" style="list-style:none">Удалить…</summary>
@@ -1270,13 +1384,14 @@ def render(msg=None, err=None, jid=None, readonly=False):
     dns = dns_a(MSK_DOMAIN)
     dns_ok = s4 in dns
     add_card = f"""<div class="card"><h2>Добавить сервер</h2>
-<form method="post" action="/admin/servers/add">
+<form method="post" action="/admin/servers/add" class="addr">
 <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(200px,1fr))">
 <label>Название<input type="text" name="name" required maxlength="40" placeholder="Франкфурт"></label>
 <label>Код страны<input type="text" name="cc" maxlength="2" placeholder="DE"></label>
-<label>IPv4<input type="text" name="ip4" placeholder="1.2.3.4"></label>
-<label>IPv6 (желательно)<input type="text" name="ip6" placeholder="2a01:…::2"></label>
-<label>Домен (необязательно)<input type="text" name="host" placeholder="exit3.example.com"></label>
+<label>Домен<input type="text" name="host" placeholder="exit3.example.com" list="dl-add"><datalist id="dl-add"></datalist></label>
+<label>IPv4<input type="text" name="ip4" placeholder="из DNS или 1.2.3.4"></label>
+<label>IPv6 (желательно)<input type="text" name="ip6" placeholder="из DNS или 2a01:…::2"></label>
+<div class="mut lk" style="grid-column:1/-1;min-height:1.2em"></div>
 <label>Приоритет<input type="text" name="priority" value="{max([e['priority'] for e in db.get('exits', {}).values()] + [0]) + 1}"></label>
 <label>Сайт-маскировка Reality<select name="sni" style="font:inherit;color:#e8e8e8;background:#0e1015;border:1px solid #343a48;border-radius:8px;padding:9px 12px;width:100%">{sni_opts}</select></label>
 <label>Порт Reality<input type="text" name="port" value="443"></label>
@@ -1286,7 +1401,8 @@ def render(msg=None, err=None, jid=None, readonly=False):
 <button class="btn" style="margin-top:14px">Добавить и установить</button>
 <p class="note">Портал подключится к серверу по SSH, поставит Docker и ноду Remnawave, закроет порт управления для всех,
 кроме MSK, создаст ключи и включит сервер в цепочку. Пароль используется один раз и нигде не сохраняется.
-Требования: чистый Linux-сервер (Ubuntu/Debian) вне РФ, свободный порт Reality. Если IPv4 сервера окажется заблокирован
+Достаточно указать домен — IPv4/IPv6 подтянутся из DNS (и сверятся с самим сервером),
+или IP — портал подскажет домены, которые на него указывают. Требования: чистый Linux-сервер (Ubuntu/Debian) вне РФ, свободный порт Reality. Если IPv4 сервера окажется заблокирован
 в РФ, мост автоматически пойдёт по IPv6.</p></form></div>
 """
     msk_card = (f'<div class="kv"><span>Адрес MSK (разрешён в файрволах выходов)</span><span>{esc(s4)} · {esc(s6 or "—")}</span></div>'
@@ -1324,7 +1440,7 @@ def render(msg=None, err=None, jid=None, readonly=False):
 <div class="card"><h2>Критические ошибки</h2>{errors_html}</div></div></details>
 <div class="card"><h2>Вход MSK</h2>{msk_card}</div>
 </div>"""
-    return C.page(f"{C.BRAND} — серверы", body)
+    return C.page(f"{C.BRAND} — серверы", body, ADDR_JS)
 
 
 # ---------------------------------------------------------------- HTTP handlers (called from app.H)
@@ -1350,9 +1466,47 @@ def confirm_form(token, pend):
 </form>"""
 
 
+ADDR_JS = r"""
+document.querySelectorAll('form.addr').forEach(function (f) {
+  var h = f.elements.host, v4 = f.elements.ip4, v6 = f.elements.ip6, lk = f.querySelector('.lk'), dl = h.list;
+  function get(q, cb) { fetch('/admin/servers/lookup?' + q, {credentials: 'same-origin'}).then(function (r) { return r.json(); }).then(cb, function () {}); }
+  function note(t) { if (lk) lk.textContent = t; }
+  h.addEventListener('change', function () {
+    var d = h.value.trim(); if (!d) return;
+    note('DNS: смотрю ' + d + '…');
+    get('host=' + encodeURIComponent(d), function (r) {
+      if (r.error) return note(r.error);
+      if (!v4.value.trim() && r.v4.length) v4.value = r.v4[0];
+      if (!v6.value.trim() && r.v6.length) v6.value = r.v6[0];
+      var t = 'DNS ' + r.host + ': A ' + (r.v4.join(', ') || '—') + ', AAAA ' + (r.v6.join(', ') || '—');
+      var ip = v4.value.trim();
+      if (ip && r.v4.length && r.v4.indexOf(ip) < 0) t += ' — не совпадает с IPv4 ' + ip + ' (после смены IP DNS обновляется до суток; мост идёт по IP)';
+      note(t);
+    });
+  });
+  [v4, v6].forEach(function (inp) {
+    inp.addEventListener('change', function () {
+      var ip = inp.value.trim(); if (!ip || ip.indexOf('/') >= 0) return;
+      note('Ищу домены для ' + ip + '…');
+      get('ip=' + encodeURIComponent(ip), function (r) {
+        if (r.error) return note(r.error);
+        var all = r.match.concat(r.ptr ? [r.ptr] : []);
+        dl.innerHTML = ''; all.forEach(function (n) { var o = document.createElement('option'); o.value = n; dl.appendChild(o); });
+        if (!all.length) return note('Доменов на ' + ip + ' среди известных зон не найдено');
+        if (!h.value.trim() && r.match.length === 1) h.value = r.match[0];
+        note('На ' + ip + ' указывают: ' + (r.match.join(', ') || '—') + (r.ptr ? ' · PTR ' + r.ptr : '') + ' — выберите в поле «домен»');
+      });
+    });
+  });
+});
+"""
+
+
 def handle_get(h, path, q, readonly=False):
     if path in ("/admin/servers", "/admin/servers/"):
         return h.send(200, render(q.get("msg", [None])[0], q.get("err", [None])[0], q.get("job", [None])[0], readonly))
+    if path == "/admin/servers/lookup":
+        return h.send(200, json.dumps(lookup({k: v[0] for k, v in q.items()}), ensure_ascii=False), "application/json")
     return None
 
 
