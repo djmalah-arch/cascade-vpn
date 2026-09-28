@@ -191,6 +191,22 @@ def out_tags(eid, e):
     return tags
 
 
+def dns_mismatch(e):
+    """Hostname set but its A records don't include the exit's IPv4 (stale DNS after an IP change) -> resolved list."""
+    host, ip4 = e.get("host"), e.get("ip4")
+    if not (host and ip4):
+        return None
+    try:
+        addrs = sorted({a[4][0] for a in socket.getaddrinfo(host, None, socket.AF_INET)})
+    except OSError:
+        addrs = []
+    return None if ip4 in addrs else addrs
+
+
+def bridge_addr(e):
+    return e["ip4"] if dns_mismatch(e) is not None else (e.get("host") or e["ip4"])
+
+
 def bridge_out(tag, addr, e, bridge_uuid):
     return {"tag": tag, "protocol": "vless",
             "settings": {"vnext": [{"address": addr, "port": e.get("port", 443),
@@ -241,7 +257,7 @@ def msk_profile(db, plan):
         if not tags:
             continue
         if e.get("host") or e.get("ip4"):
-            outs.append(bridge_out(f"x-{eid}-4", e.get("host") or e["ip4"], e, st["bridge_uuid"]))
+            outs.append(bridge_out(f"x-{eid}-4", bridge_addr(e), e, st["bridge_uuid"]))
         if e.get("ip6"):
             outs.append(bridge_out(f"x-{eid}-6", e["ip6"], e, st["bridge_uuid"]))
         p4, p6 = ports[eid]
@@ -974,6 +990,10 @@ def do_add(log, f):
             event(db, f"Добавлен сервер {name} (приоритет {prio})")
             C.save_db(db)
         created["db"] = True
+        bad = dns_mismatch(e)
+        if bad is not None:
+            log(f"ВНИМАНИЕ: {host} указывает на {', '.join(bad) or 'ничего'}, а не на {ip4} — мост пойдёт напрямую по IP. "
+                "Обновите A-запись домена (для клиентов).")
         log("Обновляю маршрутизацию MSK…")
         apply(db, compute_plan(db))
         with C.LOCK:
@@ -1104,8 +1124,11 @@ def update_address(eid, form):
     with C.LOCK:
         fresh = C.load_db(); fresh["balancer"] = db["balancer"]; C.save_db(fresh)
     STATUS.pop(eid, None); COUNTERS.pop(eid, None)
+    bad = dns_mismatch(e)
+    dns = (f" Внимание: {host} указывает на {', '.join(bad) or 'ничего'}, а не на {ip4} — мост идёт по IP, "
+           "обновите A-запись домена." if bad is not None else "")
     if how:
-        return f"Адрес обновлён, управление нодой доступно {how}. Канал проверится в течение минуты."
+        return f"Адрес обновлён, управление нодой доступно {how}. Канал проверится в течение минуты." + dns
     return (f"Адрес сохранён, но порт управления {np_} по новым адресам недоступен с MSK: проверьте адрес "
             "и что на сервере в файрволе разрешён текущий адрес MSK.")
 
