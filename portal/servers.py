@@ -204,7 +204,8 @@ def dns_mismatch(e):
 
 
 def bridge_addr(e):
-    return e["ip4"] if dns_mismatch(e) is not None else (e.get("host") or e["ip4"])
+    # The IP is authoritative (updated via the portal at once); DNS may lag up to a day after an IP change.
+    return e.get("ip4") or e["host"]
 
 
 def bridge_out(tag, addr, e, bridge_uuid):
@@ -992,8 +993,7 @@ def do_add(log, f):
         created["db"] = True
         bad = dns_mismatch(e)
         if bad is not None:
-            log(f"ВНИМАНИЕ: {host} указывает на {', '.join(bad) or 'ничего'}, а не на {ip4} — мост пойдёт напрямую по IP. "
-                "Обновите A-запись домена (для клиентов).")
+            log(f"ВНИМАНИЕ: {host} указывает на {', '.join(bad) or 'ничего'}, а не на {ip4} — обновите A-запись (мост MSK всё равно идёт по IP; DNS может обновляться до суток).")
         log("Обновляю маршрутизацию MSK…")
         apply(db, compute_plan(db))
         with C.LOCK:
@@ -1125,8 +1125,8 @@ def update_address(eid, form):
         fresh = C.load_db(); fresh["balancer"] = db["balancer"]; C.save_db(fresh)
     STATUS.pop(eid, None); COUNTERS.pop(eid, None)
     bad = dns_mismatch(e)
-    dns = (f" Внимание: {host} указывает на {', '.join(bad) or 'ничего'}, а не на {ip4} — мост идёт по IP, "
-           "обновите A-запись домена." if bad is not None else "")
+    dns = (f" Внимание: {host} указывает на {', '.join(bad) or 'ничего'}, а не на {ip4} — обновите A-запись "
+           "(мост MSK идёт по IP, DNS может обновляться до суток)." if bad is not None else "")
     if how:
         return f"Адрес обновлён, управление нодой доступно {how}. Канал проверится в течение минуты." + dns
     return (f"Адрес сохранён, но порт управления {np_} по новым адресам недоступен с MSK: проверьте адрес "
