@@ -446,6 +446,8 @@ def msk_profile(db, plan):
         rules += [{"domain": ["geosite:" + g for g in dj.get("geosite", [])] + ["domain:" + x for x in dj["domains"]],
                    "outboundTag": "direct"},
                   {"ip": dj["ips"], "outboundTag": "direct"}]
+        if dj.get("udp_ports"):       # game servers known only by port (hosted anywhere, e.g. War Thunder)
+            rules.append({"network": "udp", "port": ",".join(dj["udp_ports"]), "outboundTag": "direct"})
     except (OSError, ValueError, KeyError) as e:
         print("direct.json not applied:", e, flush=True)
     rules += [

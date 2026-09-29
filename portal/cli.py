@@ -57,9 +57,12 @@ def templates():
                 if srv.get("tag") == "local":
                     srv.update({"type": "udp", "server": "77.88.8.8"})
             rules = [r for r in tj["route"]["rules"]
-                     if not (r.get("outbound") == "direct" and ("domain_suffix" in r or "ip_cidr" in r))]
+                     if not (r.get("outbound") == "direct" and ("domain_suffix" in r or "ip_cidr" in r or "port_range" in r))]
             pos = next((i + 1 for i, r in enumerate(rules) if r.get("action") == "hijack-dns"), len(rules))
             rules.insert(pos, {"domain_suffix": direct["domains"], "ip_cidr": direct["ips"], "outbound": "direct"})
+            if direct.get("udp_ports"):
+                rules.insert(pos + 1, {"network": "udp", "port_range": [p.replace("-", ":") for p in direct["udp_ports"]],
+                                       "outbound": "direct"})
             tj["route"]["rules"] = rules
         app.rw("PATCH", "/api/subscription-templates", {"uuid": t["uuid"], "templateJson": tj})
         print(f"template {t['templateType']}: ok")
