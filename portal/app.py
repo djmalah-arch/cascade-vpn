@@ -678,7 +678,7 @@ def geo_install(files):
             if rc != 0:
                 raise RuntimeError(f"docker cp {name}: {out[-200:]}")
         st = json.load(open(STATE))
-        rw("POST", f"/api/nodes/{st['nodes']['MSK']}/actions/restart", {})
+        rw("POST", f"/api/nodes/{st['nodes']['MSK']}/actions/restart", {"forceRestart": True})
         for _ in range(12):
             time.sleep(5)
             if probe(10808)[0] and sh(["curl", "-s", "-m", "10", "-o", "/dev/null", "-w", "%{http_code}", "--socks5-hostname",
@@ -686,8 +686,11 @@ def geo_install(files):
                 return True
         return False
 
-    if put(files):
-        return True
+    try:
+        if put(files):
+            return True
+    except Exception as e:
+        print("geo install failed:", repr(e), flush=True)
     put({n: os.path.join(prev, n) for n in files})
     raise RuntimeError("после обновления geoip/geosite xray не заработал — возвращены прежние файлы")
 
