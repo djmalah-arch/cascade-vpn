@@ -144,7 +144,7 @@ def awg_config():
     os.makedirs(app.AWG_DIR, exist_ok=True)
     open(os.path.join(app.AWG_DIR, "params.env"), "w").write("".join(f"{k}={v}\n" for k, v in params.items()))
     open(os.path.join(app.AWG_DIR, "server.pub"), "w").write(pk + "\n")
-    open(conf, "w").write("[Interface]\n" f"PrivateKey = {sk}\nAddress = {app.AWG_NET}.1/24\nListenPort = {AWG_PORT}\n"
+    open(conf, "w").write("[Interface]\n" f"PrivateKey = {sk}\nAddress = {app.AWG_NET}.1/24, {app.AWG_NET6}1/64\nListenPort = {AWG_PORT}\n"
                           + "".join(f"{k} = {v}\n" for k, v in params.items())
                           + "PostUp = /usr/local/bin/tproxy.sh up\nPostDown = /usr/local/bin/tproxy.sh down\n")
     for f in os.listdir(app.AWG_DIR):

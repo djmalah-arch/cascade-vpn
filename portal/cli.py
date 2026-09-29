@@ -4,7 +4,9 @@
   docker exec geovpn-portal geovpn apply-direct          # apply direct.json (games etc. bypass the VPN) everywhere
   docker exec geovpn-portal geovpn happ-routing          # re-send the Happ routing profile in the subscription
   docker exec geovpn-portal geovpn set-password admin|users 'NEW'
-  docker exec geovpn-portal geovpn backup                # make a backup now
+  docker exec geovpn-portal geovpn backup                # make a backup now (+ copy to the lowest-priority exit)
+  docker exec -it geovpn-portal geovpn host-extras <id>  # exit: fail2ban, MTU probing, backup receiver (asks root password)
+  docker exec geovpn-portal geovpn geo-update            # refresh geoip/geosite on MSK now (normally weekly)
   docker exec geovpn-portal geovpn status
 """
 import base64, hashlib, json, os, secrets, sys
@@ -107,8 +109,29 @@ def main():
             print("MSK node was disabled by the panel - enabled")
         print("MSK node connected:", n.get("isConnected"))
     elif a[0] == "backup":
-        app.backup()
-        print("backup: ok ->", app.BACKUP_DIR)
+        where = app.backup()
+        print("backup: ok ->", app.BACKUP_DIR, f"+ copy on exit {where}" if where else "(no exits for a copy)")
+    elif a[0] == "host-extras" and len(a) == 2:
+        import getpass
+        import servers
+        db = app.load_db()
+        e = db.get("exits", {}).get(a[1])
+        if not e:
+            sys.exit("unknown exit id; ids: " + ", ".join(db.get("exits", {})))
+        pw = getpass.getpass(f"root password of {e['name']}: ") if sys.stdin.isatty() else sys.stdin.readline().strip()
+        c = None
+        for h in [x for x in (e.get("ip4"), e.get("ip6")) if x]:
+            try:
+                c = servers.ssh_connect(h, e.get("ssh_port", 22), pw)
+                break
+            except Exception as ex:
+                print(f"{h}: {ex}")
+        if not c:
+            sys.exit("SSH failed")
+        servers.host_extras(c, db)
+        c.close()
+    elif a[0] == "geo-update":
+        print(app.geo_update(force=True))
     elif a[0] == "status":
         m = app.collect_monitoring()
         for k, v in m["services"].items():

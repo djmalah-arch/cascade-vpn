@@ -46,6 +46,8 @@ LISTEN = ("127.0.0.1", 8090)
 DB_PATH = P("db.json", "/var/lib/geovpn-portal/db.json")
 AWG_DIR = os.environ.get("AWG_DIR", "/etc/amnezia/amneziawg")
 AWG_NET = "10.66.66"
+AWG_NET6 = "fd66:66:66::"   # ULA: clients' IPv6 goes into the tunnel too (without it, it bypasses the VPN)
+AWG_DNS = ("8.8.8.8", "77.88.8.8")   # any public resolver: xray on MSK answers port 53 itself (DoH + cache)
 APP_DIR = os.environ.get("APP_DIR", "/opt/geovpn-portal/app")
 SECRETS = P("secrets.env", "/root/geovpn-secrets.env")
 PORTAL_ENV = P("portal.env", "/etc/geovpn/portal.env")   # SERVERS_PASS/USERS_PASS (pbkdf2 salt$hash), SESSION_SECRET
@@ -189,9 +191,14 @@ def log_error(text):
         db = load_db()
         errs = db.setdefault("errors", [])
         now = now_utc()
-        if errs and errs[0]["text"] == text and (now - parse_ts(errs[0]["last"])).total_seconds() < 1800:
-            errs[0]["count"] = errs[0].get("count", 1) + 1
-            errs[0]["last"] = now.isoformat()
+        # also when other errors came in between (two nodes failing in turn made dozens of separate lines)
+        same = next((i for i, x in enumerate(errs[:20]) if x["text"] == text
+                     and (now - parse_ts(x["last"])).total_seconds() < 1800), None)
+        if same is not None:
+            e = errs.pop(same)
+            e["count"] = e.get("count", 1) + 1
+            e["last"] = now.isoformat()
+            errs.insert(0, e)
         else:
             errs.insert(0, {"ts": now.isoformat(), "last": now.isoformat(), "text": text, "count": 1})
             del errs[100:]
@@ -266,14 +273,19 @@ def awg_new_peer(db):
     raise RuntimeError("Нет свободных адресов AmneziaWG")
 
 
+def awg_ip6(ip4):
+    return AWG_NET6 + ip4.rsplit(".", 1)[1]
+
+
 def awg_client_conf(peer):
     p = awg_params()
     spub, port = awg_server()
     # MTU 1376 (as AmneziaVPN itself uses): default 1420 breaks big packets on mobile networks with smaller MTU
-    lines = ["[Interface]", f"PrivateKey = {peer['priv']}", f"Address = {peer['ip']}/32", "DNS = 1.1.1.1, 1.0.0.1", "MTU = 1376"]
+    lines = ["[Interface]", f"PrivateKey = {peer['priv']}", f"Address = {peer['ip']}/32, {awg_ip6(peer['ip'])}/128",
+             "DNS = " + ", ".join(AWG_DNS), "MTU = 1376"]
     lines += [f"{k} = {v}" for k, v in p.items()]
     lines += ["", "[Peer]", f"PublicKey = {spub}", f"PresharedKey = {peer['psk']}", f"Endpoint = {HOST}:{port}",
-              "AllowedIPs = 0.0.0.0/0", "PersistentKeepalive = 25", ""]
+              "AllowedIPs = 0.0.0.0/0, ::/0", "PersistentKeepalive = 25", ""]
     return "\n".join(lines)
 
 
@@ -283,14 +295,14 @@ def awg_vpn_key(peer, title):
     spub, port = awg_server()
     conf = awg_client_conf(peer)
     last = dict(p)
-    last.update({"allowed_ips": ["0.0.0.0/0"], "clientId": "", "client_ip": peer["ip"], "client_priv_key": peer["priv"],
+    last.update({"allowed_ips": ["0.0.0.0/0", "::/0"], "clientId": "", "client_ip": peer["ip"], "client_priv_key": peer["priv"],
                  "client_pub_key": peer["pub"], "config": conf, "hostName": HOST, "mtu": "1376",
                  "persistent_keep_alive": "25", "port": int(port), "psk_key": peer["psk"], "server_pub_key": spub})
     awg = dict(p)
     awg.update({"last_config": json.dumps(last, ensure_ascii=False), "port": port, "protocol_version": "2",
                 "subnet_address": f"{AWG_NET}.0", "transport_proto": "udp"})
     data = {"containers": [{"awg": awg, "container": "amnezia-awg2"}], "defaultContainer": "amnezia-awg2",
-            "description": title, "dns1": "1.1.1.1", "dns2": "1.0.0.1", "hostName": HOST}
+            "description": title, "dns1": AWG_DNS[0], "dns2": AWG_DNS[1], "hostName": HOST}
     raw = json.dumps(data, ensure_ascii=False).encode()
     blob = len(raw).to_bytes(4, "big") + zlib.compress(raw, 8)
     return "vpn://" + base64.urlsafe_b64encode(blob).decode().rstrip("=")
@@ -302,11 +314,14 @@ def awg_apply(db):
     path = f"{AWG_DIR}/awg0.conf"
     conf = open(path, encoding="utf-8").read()
     head = conf.split("\n[Peer]")[0].rstrip() + "\n"
+    if AWG_NET6 not in head:        # installs before IPv6 in the tunnel: the server's IPv6 tunnel address
+        head = re.sub(r"(?m)^(Address\s*=\s*[^\n,]+)$", rf"\1, {AWG_NET6}1/64", head)
     peers = []
     for slug, u in sorted(db["users"].items()):
         if u.get("awg") and u["rw_id"] in active:
             a = u["awg"]
-            peers.append(f"\n[Peer]\n# {slug}\nPublicKey = {a['pub']}\nPresharedKey = {a['psk']}\nAllowedIPs = {a['ip']}/32\n")
+            peers.append(f"\n[Peer]\n# {slug}\nPublicKey = {a['pub']}\nPresharedKey = {a['psk']}\n"
+                         f"AllowedIPs = {a['ip']}/32, {awg_ip6(a['ip'])}/128\n")
     new = head + "".join(peers)
     if new != conf:
         with open(path + ".tmp", "w", encoding="utf-8") as f:
@@ -396,7 +411,7 @@ def create_user(name, group=MOD_GROUP):
             "username": slug, "description": name, "trafficLimitBytes": 0, "trafficLimitStrategy": "NO_RESET",
             "expireAt": (now_utc() + dt.timedelta(days=VALID_DAYS)).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
             "activeInternalSquads": [st["squads"]["clients"]]})
-        db["users"][slug] = {"name": name, "rw_id": u["id"], "page": f"{slug}-{secrets.token_hex(3)}",
+        db["users"][slug] = {"name": name, "rw_id": u["id"], "page": new_page_id(slug),
                              "created": now_utc().isoformat(), "awg": awg_new_peer(db), "mt": secrets.token_hex(16),
                              "group": group}
         save_db(db)
@@ -435,7 +450,7 @@ def user_action(slug, action, role="a", group=None):
             u["awg"] = None
             u["awg"] = awg_new_peer(db)
             u["mt"] = secrets.token_hex(16)
-            u["page"] = f"{slug}-{secrets.token_hex(3)}"
+            u["page"] = new_page_id(slug)
         elif action == "delete":
             try:
                 rw("DELETE", f"/api/users/{uid}")
@@ -469,7 +484,7 @@ def import_existing():
                 peer = {"ip": re.search(r"Address\s*=\s*([\d.]+)", t).group(1), "priv": priv, "pub": pub,
                         "psk": re.search(r"PresharedKey\s*=\s*(\S+)", t).group(1)}
             db["users"][slug] = {"name": ru.get("description") or slug, "rw_id": ru["id"],
-                                 "page": f"{slug}-{secrets.token_hex(3)}", "created": ru.get("createdAt"),
+                                 "page": new_page_id(slug), "created": ru.get("createdAt"),
                                  "awg": peer or awg_new_peer(db)}
             changed = True
         for u in db["users"].values():          # MTProxy secret for users created before it existed
@@ -519,6 +534,7 @@ def collect_monitoring():
         m["backup"] = dt.datetime.fromtimestamp(os.path.getmtime(os.path.join(BACKUP_DIR, b[-1])), dt.timezone.utc) if b else None
     except OSError:
         m["backup"] = None
+    m["offsite"] = load_db().get("backup_offsite")
     return m
 
 
@@ -570,25 +586,141 @@ def backup():
     os.chmod(out, 0o600)
     for f in sorted(x for x in os.listdir(BACKUP_DIR) if x.startswith("msk-"))[:-14]:
         os.remove(os.path.join(BACKUP_DIR, f))
-    target = SITE.get("BACKUP_SSH")            # optional offsite copy: user@host (key: <data>/ssh/backup_key)
-    key = os.path.join(DATA, "ssh", "backup_key")
-    if target and os.path.exists(key):
-        import paramiko
-        user, host = target.split("@", 1)
-        c = paramiko.SSHClient(); c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        c.connect(host, username=user, key_filename=key, timeout=20, allow_agent=False, look_for_keys=False)
-        sftp = c.open_sftp()
-        try:
-            sftp.mkdir("geovpn-backups")
-        except OSError:
-            pass
-        sftp.put(out, f"geovpn-backups/{os.path.basename(out)}")
-        sftp.close(); c.close()
+    return backup_offsite(out)
+
+
+def backup_offsite(path):
+    """Copy the backup to an exit: the lowest-priority one first (it carries the least traffic), then the others.
+    The exit stores it via a restricted key (servers.HOST_EXTRAS: geovpn-backup-recv, 30 copies)."""
+    import paramiko
+    name = os.path.basename(path)
+    db = load_db()
+    exits = sorted(db.get("exits", {}).values(), key=lambda e: (not e.get("enabled"), -e.get("priority", 0)))
+    if not exits:
+        return None
+    servers.backup_pubkey()
+    errs = []
+    for e in exits:
+        for host in [h for h in (e.get("ip4"), e.get("ip6")) if h]:
+            try:
+                c = paramiko.SSHClient()
+                c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                c.connect(host, username="root", key_filename=servers.BACKUP_KEY, timeout=15,
+                          allow_agent=False, look_for_keys=False)
+                ch = c.get_transport().open_session()
+                ch.settimeout(300)
+                ch.exec_command("put " + name)
+                with open(path, "rb") as f:
+                    for chunk in iter(lambda: f.read(65536), b""):
+                        ch.sendall(chunk)
+                ch.shutdown_write()
+                res = ch.makefile("rb").read().decode(errors="replace").strip()
+                c.close()
+                if res.startswith("ok"):
+                    with LOCK:
+                        fresh = load_db()
+                        fresh["backup_offsite"] = {"ts": now_utc().isoformat(), "server": e["name"]}
+                        save_db(fresh)
+                    return e["name"]
+                errs.append(f"{e['name']}: {res or 'нет ответа'}")
+                break                       # reachable, but refused: the other address won't help
+            except Exception as ex:
+                errs.append(f"{e['name']} ({host}): {ex}")
+    raise RuntimeError("копия бэкапа не отправлена ни на один выход (" + "; ".join(errs)[:300]
+                       + "). Ключ приёма ставится при добавлении сервера или: geovpn host-extras <id>")
+
+
+# ---------------------------------------------------------------- geoip/geosite for MSK routing (RU, YouTube, games...)
+# The node image carries the lists of its build date and is pinned, so they would never change. Weekly: fetch fresh
+# ones (same source as Xray's release), check them, copy into the node and restart xray; roll back if it breaks.
+GEO_URL = "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/"
+GEO_DIR = P("geo", "/var/lib/geovpn-portal/geo")
+GEO_IN_NODE = "/usr/local/share/xray"
+GEO_MUST = {"geosite.dat": (b"CATEGORY-RU", b"YOUTUBE", b"STEAM"), "geoip.dat": (b"PRIVATE",)}
+
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def geo_fetch(name):
+    """Download + verify against the published sha256; directly, or through the exits if GitHub is blocked."""
+    tmp = os.path.join(GEO_DIR, name + ".new")
+    for via in ([], ["--socks5-hostname", "127.0.0.1:10808"]):
+        rc, _ = sh(["curl", "-fsSL", "-m", "300", *via, "-o", tmp, GEO_URL + name], timeout=330)
+        rc2, sums = sh(["curl", "-fsSL", "-m", "60", *via, GEO_URL + name + ".sha256sum"])
+        if rc == 0 and rc2 == 0 and sums.split() and sha256_file(tmp) == sums.split()[0]:
+            data = open(tmp, "rb").read()
+            if len(data) > (1 << 20) and all(m in data for m in GEO_MUST[name]):
+                return tmp
+    raise RuntimeError(f"{name}: не скачан или не прошёл проверку")
+
+
+def node_geo_sha(name):
+    rc, out = sh(["docker", "exec", "remnanode", "sha256sum", f"{GEO_IN_NODE}/{name}"])
+    return out.split()[0] if rc == 0 and out else ""
+
+
+def geo_install(files):
+    """files: {name: local path}. Copy into the node, restart xray, check the channels; roll back on failure."""
+    prev = os.path.join(GEO_DIR, "prev")
+    os.makedirs(prev, exist_ok=True)
+    for name in files:
+        sh(["docker", "cp", f"remnanode:{GEO_IN_NODE}/{name}", os.path.join(prev, name)])
+
+    def put(src):
+        for name, path in src.items():
+            rc, out = sh(["docker", "cp", path, f"remnanode:{GEO_IN_NODE}/{name}"], timeout=120)
+            if rc != 0:
+                raise RuntimeError(f"docker cp {name}: {out[-200:]}")
+        st = json.load(open(STATE))
+        rw("POST", f"/api/nodes/{st['nodes']['MSK']}/actions/restart", {})
+        for _ in range(12):
+            time.sleep(5)
+            if probe(10808)[0] and sh(["curl", "-s", "-m", "10", "-o", "/dev/null", "-w", "%{http_code}", "--socks5-hostname",
+                                       "127.0.0.1:10803", "https://www.youtube.com/generate_204"])[1] == "204":
+                return True
+        return False
+
+    if put(files):
+        return True
+    put({n: os.path.join(prev, n) for n in files})
+    raise RuntimeError("после обновления geoip/geosite xray не заработал — возвращены прежние файлы")
+
+
+def geo_update(force=False):
+    os.makedirs(GEO_DIR, exist_ok=True)
+    changed = {}
+    for name in GEO_MUST:
+        tmp = geo_fetch(name)
+        if sha256_file(tmp) != node_geo_sha(name):
+            changed[name] = tmp
+        else:
+            os.replace(tmp, os.path.join(GEO_DIR, name))
+    if not changed:
+        return "geoip/geosite: актуальны"
+    geo_install(changed)
+    for name, tmp in changed.items():
+        os.replace(tmp, os.path.join(GEO_DIR, name))
+    return "geoip/geosite обновлены: " + ", ".join(changed)
+
+
+def geo_restore():
+    """The node container was re-created (update/restart of the stack): it has the image's old lists again."""
+    files = {n: os.path.join(GEO_DIR, n) for n in GEO_MUST if os.path.exists(os.path.join(GEO_DIR, n))}
+    files = {n: p for n, p in files.items() if node_geo_sha(n) not in ("", sha256_file(p))}
+    if files:
+        geo_install(files)
+        print("geo lists restored in the node:", ", ".join(files), flush=True)
 
 
 def scheduler():
     """Docker mode only: heartbeat every minute, backup daily ~03:30 MSK, installers weekly."""
-    last = {"backup": None, "apps": 0}
+    last = {"backup": None, "apps": 0, "geo": None, "geo_check": 0}
     while True:
         try:
             heartbeat()
@@ -601,6 +733,18 @@ def scheduler():
                 backup()
             except Exception as e:
                 log_error(f"Бэкап не сделан: {e}")
+        if msk.weekday() == 0 and msk.hour == 4 and last["geo"] != msk.date():      # Monday ~04:00 MSK
+            last["geo"] = msk.date()
+            try:
+                print(geo_update(), flush=True)
+            except Exception as e:
+                log_error(f"Обновление geoip/geosite: {e}")
+        elif time.time() - last["geo_check"] > 3600 and time.time() - STARTED > STARTUP_GRACE:
+            last["geo_check"] = time.time()
+            try:
+                geo_restore()
+            except Exception as e:
+                log_error(f"Возврат свежих geoip/geosite в ноду: {e}")
         if time.time() - last["apps"] > 7 * 86400:
             last["apps"] = time.time()
             rc, out = sh(["bash", "/app/scripts/apps-update.sh"], timeout=3600)
@@ -621,6 +765,14 @@ def ensure_awg_routing():
     if "local default" not in sh(["ip", "route", "show", "table", "100"])[1]:
         sh(["ip", "route", "replace", "local", "0.0.0.0/0", "dev", "lo", "table", "100"])
         log_error("Маршрут AmneziaWG в table 100 пропал — восстановлен автоматически")
+    if AWG_NET6 in open(f"{AWG_DIR}/awg0.conf", encoding="utf-8").read():     # IPv6 in the tunnel
+        if AWG_NET6 + "1/64" not in sh(["ip", "-6", "addr", "show", "dev", "awg0"])[1]:
+            sh(["ip", "-6", "addr", "add", AWG_NET6 + "1/64", "dev", "awg0"])
+        if "lookup 100" not in sh(["ip", "-6", "rule"])[1]:
+            sh(["ip", "-6", "rule", "add", "fwmark", "0x1", "lookup", "100"])
+            log_error("Правило маршрутизации AmneziaWG IPv6 пропало — восстановлено автоматически")
+        if "local default" not in sh(["ip", "-6", "route", "show", "table", "100"])[1]:
+            sh(["ip", "-6", "route", "replace", "local", "::/0", "dev", "lo", "table", "100"])
 
 
 def background():
@@ -769,6 +921,10 @@ def render_admin(msg=None, err=None, hl=None, role="u", gfilter=None):
             f'<div class="kv"><span>Аптайм</span><span>{esc(h["uptime"])}</span></div>'
             f'<div class="kv"><span>Последний бэкап</span><span>'
             f'{pill(bk and (now_utc() - bk).days < 2, ago(bk), ago(bk))}</span></div>')
+    off = m.get("offsite") or {}
+    ot = parse_ts(off.get("ts"))
+    host += (f'<div class="kv"><span>Копия на выходе</span><span>'
+             f'{pill(ot and (now_utc() - ot).days < 2, esc(off.get("server", "")) + ", " + ago(ot), "нет" if not ot else ago(ot))}</span></div>')
 
     # users (moderator: only MOD_GROUP; admin: all or the selected group)
     is_admin = role == "a"
@@ -1095,6 +1251,26 @@ def render_user(u, client_ip):
     return page(f"{BRAND} — подключение", f"<style>{USER_CSS}</style>" + body, USER_JS)
 
 
+def new_page_id(slug):
+    # the personal page holds every key of the user: 128 random bits (it used to be 24 bits after a guessable name)
+    return f"{slug}-{secrets.token_hex(16)}"
+
+
+PAGE_MISSES = {}     # client ip -> [timestamps of unknown /sub/... ids]: throttles guessing of page addresses
+
+
+def page_throttled(ip, miss=False):
+    now = time.time()
+    with LOCK:
+        t = [x for x in PAGE_MISSES.get(ip, []) if now - x < 600]
+        if miss:
+            t.append(now)
+        PAGE_MISSES[ip] = t
+        if len(PAGE_MISSES) > 10000:
+            PAGE_MISSES.clear()
+        return len(t) > 20
+
+
 def find_by_page(pid):
     for slug, u in load_db()["users"].items():
         if u["page"] == pid:
@@ -1200,8 +1376,12 @@ class H(BaseHTTPRequestHandler):
         try:
             m = re.fullmatch(r"/(?:sub|c)/([a-z0-9-]+)(/conf)?/?", p)
             if m:
+                ip = self.client_ip()
+                if page_throttled(ip):
+                    return self.send(429, "Too many requests, try again in 10 minutes", "text/plain")
                 slug, u = find_by_page(m.group(1))
                 if not u:
+                    page_throttled(ip, miss=True)
                     return self.not_found()
                 if m.group(2):
                     r = rw_user_by_id(u["rw_id"])

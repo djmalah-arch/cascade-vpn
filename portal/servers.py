@@ -95,6 +95,74 @@ def install_fw_key(c):
     return o.read().decode().strip() == "ok"
 
 
+BACKUP_KEY = C.P("ssh/geovpn_backup", "/root/.ssh/geovpn_backup")  # restricted key: can only store an MSK backup on an exit
+
+
+def backup_pubkey():
+    if not os.path.exists(BACKUP_KEY):
+        os.makedirs(os.path.dirname(BACKUP_KEY), mode=0o700, exist_ok=True)
+        C.sh(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "geovpn-portal-backup", "-f", BACKUP_KEY])
+    return open(BACKUP_KEY + ".pub").read().strip()
+
+
+# Host settings of an exit, outside the node's docker (safe to re-run, doesn't touch other VPNs on the server):
+#  - fail2ban for SSH: every server gets thousands of password guesses a day;
+#  - tcp_mtu_probing: path MTU MSK <-> exits is 1450, PMTU black holes must not stall connections;
+#  - receiver of MSK backups (the portal copies its daily backup to the lowest-priority exit).
+HOST_EXTRAS = r"""
+export DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1
+touch /etc/sysctl.d/99-geovpn.conf
+grep -q tcp_mtu_probing /etc/sysctl.d/99-geovpn.conf || echo "net.ipv4.tcp_mtu_probing = 1" >> /etc/sysctl.d/99-geovpn.conf
+sysctl -q -w net.ipv4.tcp_mtu_probing=1 && echo "mtu probing: on"
+command -v fail2ban-client >/dev/null || { apt-get update -qq && apt-get install -y -qq fail2ban python3-systemd; } >/dev/null 2>&1
+if command -v fail2ban-client >/dev/null; then
+  mkdir -p /etc/fail2ban/jail.d
+  cat > /etc/fail2ban/jail.d/geovpn.local <<'X'
+# GeoVPN: SSH brute force. 5 wrong passwords in 10 min -> ban 1 h, repeat offenders up to a week. MSK is never banned.
+[sshd]
+enabled = true
+backend = systemd
+journalmatch = _COMM=sshd + _COMM=sshd-session
+maxretry = 5
+findtime = 10m
+bantime = 1h
+bantime.increment = true
+bantime.maxtime = 1w
+ignoreip = 127.0.0.1/8 ::1 __MSK4__ __MSK6__
+X
+  systemctl enable -q fail2ban 2>/dev/null; systemctl restart fail2ban && sleep 2 && fail2ban-client status sshd >/dev/null && echo "fail2ban: on"
+else
+  echo "fail2ban: не установлен (нет apt?)"
+fi
+cat > /usr/local/sbin/geovpn-backup-recv <<'X'
+#!/bin/bash
+# Forced command of the GeoVPN portal backup key (authorized_keys): only stores an MSK backup sent on stdin.
+d=/root/geovpn-backups
+n=${SSH_ORIGINAL_COMMAND#put }
+[[ $SSH_ORIGINAL_COMMAND == "put "* && $n =~ ^msk-[0-9]{8}-[0-9]{4}\.tar\.gz$ ]] || { echo denied; exit 1; }
+mkdir -p -m 700 $d
+if head -c 512M > "$d/.$n.part" && [ -s "$d/.$n.part" ]; then mv "$d/.$n.part" "$d/$n"; chmod 600 "$d/$n"
+else rm -f "$d/.$n.part"; echo failed; exit 1; fi
+ls -1t $d/msk-*.tar.gz | tail -n +31 | xargs -r rm -f
+echo "ok $(du -h "$d/$n" | cut -f1)"
+X
+chmod 755 /usr/local/sbin/geovpn-backup-recv
+mkdir -p /root/.ssh && touch /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys
+sed -i '\#__BKEY__#d' /root/.ssh/authorized_keys
+echo 'command="/usr/local/sbin/geovpn-backup-recv",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty __BKEYLINE__' >> /root/.ssh/authorized_keys
+echo "backup receiver: on"
+"""
+
+
+def host_extras(c, db, log=print):
+    """Run HOST_EXTRAS on an exit (open paramiko session as root). Failures here don't break the exit itself."""
+    v4, v6 = msk_addrs(db)
+    key = backup_pubkey()
+    script = (HOST_EXTRAS.replace("__MSK4__", v4 or "").replace("__MSK6__", v6 or "")
+              .replace("__BKEY__", key.split()[1]).replace("__BKEYLINE__", key))
+    return ssh_run(c, script, log, timeout=600)
+
+
 def push_msk_addrs(db, v4, v6, log=print):
     """Tell every exit's firewall the (new) MSK address, via the restricted key (IPv6 first: exits' IPv4 is often blocked)."""
     import paramiko
@@ -304,6 +372,13 @@ def best_tag(eid, e):
     return tags[-1]  # IPv6 first when unknown: exits' IPv4 is the first thing RKN blocks
 
 
+# Users' domains are resolved on MSK for routing (geoip:ru, IPIfNonMatch) and for direct/YouTube connections.
+# DoH: queries are encrypted (the DPI of the Russian DC sees none of them) and cached by xray; plain system DNS
+# (127.0.0.53 -> 1.1.1.1/8.8.8.8) only as the last resort.
+MSK_DNS = {"servers": ["https+local://8.8.8.8/dns-query", "https+local://77.88.8.8/dns-query", "localhost"],
+           "queryStrategy": "UseIP"}
+
+
 def msk_profile(db, plan):
     st = state()
     K = st["keys"]["MSK"]
@@ -326,10 +401,16 @@ def msk_profile(db, plan):
         # MTProxy (Telegram) upstream: always abroad, Telegram is blocked in RU
         {"tag": "MTP_OUT", "listen": "127.0.0.1", "port": 10804, "protocol": "mixed", "settings": {"udp": False}},
     ]
-    outs = [{"tag": "direct", "protocol": "freedom"},
+    # direct: resolve through xray's DNS below (DoH, cached), not the host's plain-UDP resolver
+    outs = [{"tag": "direct", "protocol": "freedom", "settings": {"domainStrategy": "UseIPv4v6"}},
             # YouTube: MSK DC blocks it over IPv4 -> IPv6 first, IPv4 through zapret
             {"tag": "yt-dpi", "protocol": "freedom", "settings": {"domainStrategy": "ForceIPv6v4"}}]
-    bals, rules = [], [{"inboundTag": ["MON_YT"], "outboundTag": "yt-dpi"}]
+    # clients' plain DNS (Hiddify's remote DNS, AmneziaWG's 8.8.8.8...) is answered here by xray's DNS (DoH, cached):
+    # one round trip to MSK instead of a detour via an exit
+    outs.append({"tag": "dns-out", "protocol": "dns", "settings": {
+        "rules": [{"action": "hijack", "qtype": "1,28"}, {"action": "direct"}]}})   # A/AAAA answered here, the rest passes
+    bals, rules = [], [{"inboundTag": ["MON_YT"], "outboundTag": "yt-dpi"},
+                       {"inboundTag": ["MSK_REALITY", "MSK_HY2", "AWG_BRIDGE"], "port": "53", "outboundTag": "dns-out"}]
     for eid, e in exits_sorted(db):
         tags = out_tags(eid, e)
         if not tags:
@@ -372,7 +453,7 @@ def msk_profile(db, plan):
               {"domain": ["geosite:category-ru"], "outboundTag": "direct"},
               {"ip": ["geoip:ru"], "outboundTag": "direct"},
               dict({"network": "tcp,udp"}, **to_exits)]
-    return {"log": {"loglevel": "warning"}, "inbounds": inb, "outbounds": outs,
+    return {"log": {"loglevel": "warning"}, "inbounds": inb, "outbounds": outs, "dns": MSK_DNS,
             **({"burstObservatory": {"subjectSelector": ["x-"],
                                  "pingConfig": {"destination": "https://www.gstatic.com/generate_204",
                                                 "interval": "15s", "timeout": "8s", "sampling": 2}}} if have_exits else {}),
@@ -474,6 +555,33 @@ def names(db, ids):
     return ", ".join(db["exits"][i]["name"] for i in ids if i in db["exits"]) or "—"
 
 
+def plan_works(plan):
+    """Does xray still have a live route with this plan? Its main balancer skips dead primaries by itself and takes
+    fallbackTag when all of them are down - no profile change needed (a change restarts xray: all users' connections drop)."""
+    if not plan:
+        return False
+    if any(is_up(i) for i in plan.get("primary") or []):
+        return True
+    fb, tag = plan.get("fallback"), plan.get("fb_tag") or ""
+    if not fb or not is_up(fb):
+        return False
+    return STATUS.get(fb, {}).get("v6" if tag.endswith("-6") else "v4") is not False
+
+
+def best_prio(db, ids):
+    return min((db["exits"][i]["priority"] for i in ids or [] if i in db["exits"]), default=10 ** 6)
+
+
+def must_switch(db, old, new):
+    """Rebuild the MSK profile only when the running one has no live route any more, or to return to
+    higher-priority exits after an outage. A dead primary alone is handled inside xray (fallbackTag)."""
+    if not old:
+        return True
+    if not plan_works(old):
+        return True
+    return best_prio(db, new["primary"]) < best_prio(db, old.get("primary"))
+
+
 def heal_panel(nodes):
     """Self-repair of the panel state (both seen on prod 2026-09-27):
     - Remnawave disables a node after a few failed connects (e.g. while xray restarts) and never re-enables it.
@@ -532,7 +640,15 @@ def watchdog_tick():
     probe_all(db)
     plan = compute_plan(db)
     old = db["balancer"].get("plan")
-    if plan != old:
+    degraded = bool(old) and plan != old and not any(is_up(i) for i in old.get("primary") or [])
+    if degraded != db["balancer"].get("degraded", False):
+        db["balancer"]["degraded"] = degraded
+        event(db, f"{names(db, old['primary'])} недоступен — трафик сам ушёл на резерв {names(db, [old['fallback']])} "
+                  "(без перезапуска)" if degraded else f"{names(db, (old or {}).get('primary') or [])} снова доступен")
+        with C.LOCK:
+            fresh = C.load_db(); fresh["balancer"] = db["balancer"]; C.save_db(fresh)
+    if plan != old and must_switch(db, old, plan):
+        db["balancer"]["degraded"] = False
         apply(db, plan)
         if not old or old.get("primary") != plan["primary"]:
             down = [i for i in (old or {}).get("primary", []) if not is_up(i)]
@@ -664,6 +780,7 @@ if docker ps -a --format '{{.Names}}' | grep -qxE '__NODE__|__FW__'; then echo "
 cat >/etc/sysctl.d/99-geovpn.conf <<'X'
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
+net.ipv4.tcp_mtu_probing = 1
 X
 sysctl --system >/dev/null 2>&1 || true
 # everything else lives in __DIR__ and runs in docker: xray node + firewall of the node API port (only MSK may connect)
@@ -765,7 +882,11 @@ else
   echo "в $D нет установки GeoVPN — ничего не удаляю"
 fi
 # the portal key stays while this MSK still has other nodes here
-docker ps -aq --filter label=geovpn.msk=__MSKID__ 2>/dev/null | grep -q . || sed -i '\#__KEY__#d' /root/.ssh/authorized_keys 2>/dev/null
+# ...and so do MSK's backups (they hold all secrets) with the key that writes them
+if ! docker ps -aq --filter label=geovpn.msk=__MSKID__ 2>/dev/null | grep -q .; then
+  sed -i -e '\#__KEY__#d' -e '\#__BKEY__#d' /root/.ssh/authorized_keys 2>/dev/null
+  rm -rf /root/geovpn-backups && echo "бэкапы MSK с сервера удалены"
+fi
 # older installs (before 2026-09-27): host-level firewall unit
 if [ -f /etc/systemd/system/geovpn-fw.service ]; then
   systemctl disable --now geovpn-fw >/dev/null 2>&1 || true
@@ -1076,6 +1197,11 @@ def do_add(log, f):
             raise
         if install_fw_key(c):
             log("Ключ для автообновления адреса MSK в файрволе установлен.")
+        log("Защита SSH (fail2ban), настройки сети и приём бэкапов MSK…")
+        try:
+            host_extras(c, db, log)
+        except Exception as ex:
+            log(f"  не удалось: {ex} — на работу выхода это не влияет")
         time.sleep(5)
         if ip4 and tcp_ok(ip4, nport):
             log("Управление ноды: доступно по IPv4.")
@@ -1140,7 +1266,8 @@ def do_add(log, f):
 
 def remove_script(e):
     return (NODE_REMOVE.replace("__DIR__", nd(e, "node_dir")).replace("__FW__", nd(e, "fw_name"))
-            .replace("__PORT__", str(e.get("port", 443))).replace("__KEY__", portal_pubkey().split()[1]).replace("__MSKID__", msk_id()))
+            .replace("__PORT__", str(e.get("port", 443))).replace("__KEY__", portal_pubkey().split()[1]).replace("__MSKID__", msk_id())
+            .replace("__BKEY__", backup_pubkey().split()[1]))
 
 
 def do_delete(log, eid, pw):
@@ -1276,8 +1403,11 @@ def role_of(db, eid):
     e = db["exits"][eid]
     if not e.get("enabled"):
         return "no", "выведен из работы"
+    down = not any(is_up(i) for i in plan.get("primary") or [])
     if eid in (plan.get("primary") or []):
-        return "on", "основной — трафик идёт сюда"
+        return ("off", "основной — недоступен, трафик идёт через резерв") if down else ("on", "основной — трафик идёт сюда")
+    if down and plan.get("fallback") == eid:
+        return "on", "резерв — трафик идёт сюда"
     order = [i for i, x in exits_sorted(db, True) if i not in (plan.get("primary") or [])]
     n = order.index(eid) + 1 if eid in order else "?"
     return ("warnp" if not is_up(eid) else "no"), f"резерв {n}" + (" (следующий)" if plan.get("fallback") == eid else "")

@@ -82,7 +82,7 @@ docker compose ps                                          # состояние 
 docker exec geovpn-portal geovpn status                    # службы, YouTube, выходы
 docker exec geovpn-portal geovpn set-password admin 'NEW'  # пароль администратора (users — модератора)
 docker exec geovpn-portal geovpn apply-direct              # применить data/portal/direct.json (игры мимо VPN)
-docker exec geovpn-portal geovpn backup                    # бэкап сейчас (автоматически — ежедневно, data/portal/backups)
+docker exec geovpn-portal geovpn backup                    # бэкап сейчас (ежедневно сам, + копия на выход с наименьшим приоритетом)
 docker compose logs -f portal                              # лог портала
 git pull && docker compose build && docker compose up -d   # обновление
 ```

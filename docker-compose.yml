@@ -9,7 +9,9 @@ x-log: &log
 services:
   # ---------------------------------------------------------------- Remnawave panel (users, subscriptions, xray nodes)
   remnawave-db:
-    image: postgres:18.4
+    # every image is pinned (version tag + digest): a rebuild/pull never brings an untested version.
+    # Update deliberately: change the digest here, test, commit.
+    image: postgres:18.4@sha256:a02db8cac496f15b094798a38254f14d6e00741f709360e5e00bb6668ea31636
     container_name: remnawave-db
     restart: always
     shm_size: 256mb
@@ -21,7 +23,7 @@ services:
     <<: *log
 
   remnawave-redis:
-    image: valkey/valkey:9-alpine
+    image: valkey/valkey:9.1.2-alpine@sha256:48332870af354a799964c0012ae1194a0bf2bf894eb508f945810596dc2d8d11
     container_name: remnawave-redis
     restart: always
     command: >
@@ -33,7 +35,7 @@ services:
     <<: *log
 
   remnawave:
-    image: ${REMNAWAVE_IMAGE:-remnawave/backend:3}
+    image: ${REMNAWAVE_IMAGE:-remnawave/backend:3.4.4@sha256:63ef481550bbf49dabfa514c95d94109619cc85607730b308f7ad0b9b5599f06}
     container_name: remnawave
     restart: always
     env_file: ./data/remnawave.env
@@ -49,7 +51,7 @@ services:
   # ---------------------------------------------------------------- web: portal, personal pages, subscriptions, panel
   # listens only on 127.0.0.1:8443 (behind Reality on :443, PROXY protocol) and :80 (ACME + redirect)
   caddy:
-    image: caddy:2
+    image: caddy:2.11.4@sha256:0c994536bddb66445885237f1a5dcc1916bccea922661c76b4e9fc24061f9b52
     container_name: geovpn-caddy
     restart: always
     network_mode: host
@@ -88,7 +90,7 @@ services:
     <<: *log
 
   singbox:
-    image: ${SINGBOX_IMAGE:-ghcr.io/sagernet/sing-box:latest}
+    image: ${SINGBOX_IMAGE:-ghcr.io/sagernet/sing-box:v1.14.2@sha256:afbffd294c5eb3519cc7b4587299ef189bb0a2ca2f667cb6301fdb6b9bce9558}
     container_name: geovpn-singbox
     restart: always
     network_mode: host
