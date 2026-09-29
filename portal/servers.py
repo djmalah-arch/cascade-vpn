@@ -431,7 +431,9 @@ def msk_profile(db, plan):
     primary = plan["primary"] or []
     have_exits = any(out_tags(i, e) for i, e in exits_sorted(db, True))
     if have_exits:
-        main = {"tag": "exits", "selector": [f"x-{i}-" for i in primary] or ["x-"], "strategy": {"type": "leastPing"}}
+        fam = plan.get("fam") or {}
+        main = {"tag": "exits", "selector": [f"x-{i}-{fam.get(i, '')}" for i in primary] or ["x-"],
+                "strategy": {"type": "leastPing"}}
         if plan.get("fallback"):
             main["fallbackTag"] = best_tag(plan["fallback"], db["exits"][plan["fallback"]])
         bals.insert(0, main)
@@ -496,10 +498,15 @@ def keep_enabled(node_uuid, wait=8):
 
 # ---------------------------------------------------------------- probing / watchdog
 def probe_port(port):
+    """Channel check through a local inbound. Two unrelated targets: one flaky site must not make an exit "down"
+    (2026-09-29: api.ipify.org hangs -> Vienna and cold reserv "down" -> two needless xray restarts)."""
     t0 = time.time()
     rc, out = C.sh(["curl", "-s", "-m", "8", "--socks5-hostname", f"127.0.0.1:{port}", "https://api.ipify.org"])
-    ok = rc == 0 and bool(re.fullmatch(r"[0-9a-fA-F.:]+", out or ""))
-    return ok, int((time.time() - t0) * 1000), out if ok else None
+    if rc == 0 and re.fullmatch(r"[0-9a-fA-F.:]+", out or ""):
+        return True, int((time.time() - t0) * 1000), out
+    rc, code = C.sh(["curl", "-s", "-m", "8", "-o", "/dev/null", "-w", "%{http_code}", "--socks5-hostname",
+                     f"127.0.0.1:{port}", "https://www.gstatic.com/generate_204"])
+    return rc == 0 and code == "204", int((time.time() - t0) * 1000), None
 
 
 def probe_all(db):
@@ -512,10 +519,11 @@ def probe_all(db):
         for eid, (b, p4, p6) in jobs.items():
             ok, ms, ip = b.result()
             e = db["exits"][eid]
-            STATUS[eid] = {"ok": ok, "ms": ms, "ip": ip, "ts": C.now_utc(),
+            STATUS[eid] = {"ok": ok, "ms": ms, "ip": ip or (STATUS.get(eid, {}).get("ip") if ok else None), "ts": C.now_utc(),
                            "v4": p4.result()[0] if (e.get("host") or e.get("ip4")) else None,
                            "v6": p6.result()[0] if e.get("ip6") else None}
             c = COUNTERS.setdefault(eid, {"fail": 0, "ok": 0, "up": ok})
+            c["v6fail"] = c.get("v6fail", 0) + 1 if STATUS[eid]["v6"] is False else 0   # IPv6 bridge: failures in a row
             if ok:
                 c["ok"], c["fail"] = c["ok"] + 1, 0
                 if not c["up"] and c["ok"] >= OKS_TO_UP:
@@ -537,6 +545,11 @@ def is_up(eid):
     return COUNTERS.get(eid, {}).get("up", True)
 
 
+def v6_dead(eid):
+    """IPv6 bridge of an exit failed 3 probes in a row (~1.5 min): one lost probe must not rebuild the profile."""
+    return COUNTERS.get(eid, {}).get("v6fail", 0) >= FAILS_TO_DOWN + 1
+
+
 def compute_plan(db):
     en = exits_sorted(db, only_enabled=True)
     if not en:
@@ -549,7 +562,11 @@ def compute_plan(db):
         top = en[0][1]["priority"]
         primary = [i for i, e in en if e["priority"] == top]
     rest = [i for i, e in sorted(en, key=lambda kv: (not is_up(kv[0]), kv[1]["priority"])) if i not in primary]
-    return {"primary": primary, "fallback": rest[0] if rest else None,
+    # bridge family of the primaries: IPv6 wherever it works. Exits' IPv4 is what RKN degrades first
+    # (seen 2026-09-29: ~10% SYN loss and bursts of 8 s hangs MSK -> Vienna over IPv4, IPv6 clean);
+    # "" = both families, xray's leastPing chooses.
+    fam = {i: ("6" if db["exits"][i].get("ip6") and not v6_dead(i) else "") for i in primary}
+    return {"primary": primary, "fam": fam, "fallback": rest[0] if rest else None,
             "fb_tag": best_tag(rest[0], db["exits"][rest[0]]) if rest else None}
 
 
@@ -580,6 +597,12 @@ def must_switch(db, old, new):
     if not old:
         return True
     if not plan_works(old):
+        return True
+    # the primary is pinned to IPv6 but that family died while IPv4 works: use IPv4 instead of the reserve
+    if any(f == "6" and is_up(i) and v6_dead(i) for i, f in (old.get("fam") or {}).items()):
+        return True
+    # plans from before the family pinning: move the primary to IPv6 once
+    if "fam" not in old and any(new.get("fam", {}).values()):
         return True
     return best_prio(db, new["primary"]) < best_prio(db, old.get("primary"))
 
