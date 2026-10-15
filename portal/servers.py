@@ -403,6 +403,8 @@ def msk_profile(db, plan):
     ]
     # direct: resolve through xray's DNS below (DoH, cached), not the host's plain-UDP resolver
     outs = [{"tag": "direct", "protocol": "freedom", "settings": {"domainStrategy": "UseIPv4v6"}},
+            # same as direct, own tag for RU sites: the access log then shows whose RU traffic reaches MSK (app.routing_audit)
+            {"tag": "direct-ru", "protocol": "freedom", "settings": {"domainStrategy": "UseIPv4v6"}},
             # YouTube: MSK DC blocks it over IPv4 -> IPv6 first, IPv4 through zapret
             {"tag": "yt-dpi", "protocol": "freedom", "settings": {"domainStrategy": "ForceIPv6v4"}}]
     # clients' plain DNS (Hiddify's remote DNS, AmneziaWG's 8.8.8.8...) is answered here by xray's DNS (DoH, cached):
@@ -454,8 +456,8 @@ def msk_profile(db, plan):
         print("direct.json not applied:", e, flush=True)
     rules += [
               {"ip": ["geoip:private"], "outboundTag": "block"},
-              {"domain": ["geosite:category-ru"], "outboundTag": "direct"},
-              {"ip": ["geoip:ru"], "outboundTag": "direct"},
+              {"domain": ["geosite:category-ru"], "outboundTag": "direct-ru"},
+              {"ip": ["geoip:ru"], "outboundTag": "direct-ru"},
               dict({"network": "tcp,udp"}, **to_exits)]
     return {"log": {"loglevel": "warning"}, "inbounds": inb, "outbounds": outs, "dns": MSK_DNS,
             **({"burstObservatory": {"subjectSelector": ["x-"],

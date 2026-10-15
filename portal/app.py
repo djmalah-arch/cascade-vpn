@@ -630,6 +630,49 @@ def backup_offsite(path):
                        + "). Ключ приёма ставится при добавлении сервера или: geovpn host-extras <id>")
 
 
+# ---------------------------------------------------------------- client-side routing audit
+# Happ/Hiddify must open RU sites straight from the device (the user's own IP): from the MSK DC IP Avito answers
+# "Доступ ограничен: проблема с IP" (2026-10-15), banks may refuse too. RU traffic of MSK_REALITY/MSK_HY2 users on MSK
+# (outbound direct-ru) = Hiddify without region Russia or Happ without its routing profile. Amnezia is full-tunnel by design.
+RU_AUDIT_AWK = r"""/\[MSK_(REALITY|HY2) -> / && / email: / { e = $NF; t[e]++
+  if (index($0, "-> direct-ru]")) { r[e]++; l[e] = $1 "T" $2 } }
+END { for (e in t) print e, t[e], r[e] + 0, l[e] }"""
+RU_MIN, RU_SHARE = 20, 0.1      # RU connections in the log window (~10 MB, half a day) to call it misconfigured
+RU_SHOW_DAYS = 3
+
+
+def client_label(ua):
+    m = re.match(r"(HiddifyNext|Happ)/([\d.]+)(?: \((\w+)\)|/(\w+))?", ua or "")
+    if not m:
+        return (ua or "")[:30]
+    return " ".join(x for x in ("Hiddify" if m[1] == "HiddifyNext" else "Happ", m[2], m[3] or m[4]) if x)
+
+
+def routing_audit():
+    rc, out = sh(["docker", "exec", "remnanode", "awk", RU_AUDIT_AWK, "/var/log/xray/current"], timeout=120)
+    if rc != 0:
+        raise RuntimeError(f"разбор лога xray: rc={rc}")
+    found = {}
+    for line in out.splitlines():
+        p = line.split()
+        if len(p) == 4 and int(p[2]) >= RU_MIN and int(p[2]) >= RU_SHARE * int(p[1]):
+            found[p[0]] = {"last": p[3].replace("/", "-") + "+00:00", "ru": int(p[2]), "total": int(p[1])}
+    clients = {}
+    for rec in rw("GET", "/api/subscription-request-history?start=0&size=200").get("records", []):
+        k = str(rec["userId"])
+        if rec["requestAt"] > clients.get(k, {}).get("ts", ""):
+            clients[k] = {"ts": rec["requestAt"], "app": client_label(rec.get("userAgent"))}
+    with LOCK:
+        db = load_db()
+        seen = db.setdefault("ru_via_msk", {})
+        seen.update(found)
+        old = (now_utc() - dt.timedelta(days=RU_SHOW_DAYS)).isoformat()
+        for k in [k for k, v in seen.items() if v["last"] < old]:
+            del seen[k]
+        db.setdefault("clients", {}).update(clients)
+        save_db(db)
+
+
 # ---------------------------------------------------------------- geoip/geosite for MSK routing (RU, YouTube, games...)
 # The node image carries the lists of its build date and is pinned, so they would never change. Weekly: fetch fresh
 # ones (same source as Xray's release), check them, copy into the node and restart xray; roll back if it breaks.
@@ -723,7 +766,7 @@ def geo_restore():
 
 def scheduler():
     """Docker mode only: heartbeat every minute, backup daily ~03:30 MSK, installers weekly."""
-    last = {"backup": None, "apps": 0, "geo": None, "geo_check": 0}
+    last = {"backup": None, "apps": 0, "geo": None, "geo_check": 0, "audit": 0}
     while True:
         try:
             heartbeat()
@@ -748,6 +791,12 @@ def scheduler():
                 geo_restore()
             except Exception as e:
                 log_error(f"Возврат свежих geoip/geosite в ноду: {e}")
+        if time.time() - last["audit"] > 600 and time.time() - STARTED > STARTUP_GRACE:
+            last["audit"] = time.time()
+            try:
+                routing_audit()
+            except Exception as e:
+                print("routing audit:", repr(e), flush=True)     # diagnostics only: not worth an alarm
         if time.time() - last["apps"] > 7 * 86400:
             last["apps"] = time.time()
             rc, out = sh(["bash", "/app/scripts/apps-update.sh"], timeout=3600)
@@ -964,6 +1013,12 @@ def render_admin(msg=None, err=None, hl=None, role="u", gfilter=None):
         exp = parse_ts(r.get("expireAt"))
         exp_cls = "mut" if not exp or (exp - now_utc()).days > 14 else "warn"
         is_active = stt == "ACTIVE"
+        app_ = db.get("clients", {}).get(str(u["rw_id"]), {}).get("app")
+        rv = db.get("ru_via_msk", {}).get(str(u["rw_id"]))
+        ru_warn = (f' <span class="pill warnp" title="Российские сайты этого пользователя идут через сервер '
+                   f'({rv["ru"]} из {rv["total"]} соединений), а не напрямую с устройства: в Hiddify не выбран регион '
+                   f'«Россия», в Happ не включена маршрутизация GeoVPN. Avito и банки могут не открываться.">'
+                   f'RU через сервер · {ago(parse_ts(rv["last"]))}</span>') if rv else ""
         act = lambda a_, label, cls="alt", conf="": (
             f'<form method="post" action="/admin/u/{esc(slug)}/{a_}" style="display:inline"'
             f'{" onsubmit=" + chr(34) + "return confirm(" + esc(json.dumps(conf)) + ")" + chr(34) if conf else ""}>'
@@ -972,9 +1027,10 @@ def render_admin(msg=None, err=None, hl=None, role="u", gfilter=None):
             f'<tr class="{"hl" if slug == hl else ""}"><td><div class="nm">{esc(u["name"])}</div>'
             f'<div class="mut">{esc(slug)}</div></td>'
             f'<td>{group_cell(slug, u)}</td>'
-            f'<td><span class="pill {spill[0]}">{spill[1]}</span>{" <span class=\"pill on\">online</span>" if online else ""}</td>'
+            f'<td><span class="pill {spill[0]}">{spill[1]}</span>{" <span class=\"pill on\">online</span>" if online else ""}{ru_warn}</td>'
             f'<td><span class="{exp_cls}">{fmt_date(exp)}</span></td>'
-            f'<td class="hide-sm">{gb(tr.get("lifetimeUsedTrafficBytes"))}<div class="mut">{ago(on_rw)}</div></td>'
+            f'<td class="hide-sm">{gb(tr.get("lifetimeUsedTrafficBytes"))}<div class="mut">{ago(on_rw)}</div>'
+            f'{f"<div class=mut>{esc(app_)}</div>" if app_ else ""}</td>'
             f'<td class="hide-sm">{gb((a.get("rx") or 0) + (a.get("tx") or 0))}<div class="mut">{ago(hs)}</div></td>'
             f'<td class="hide-sm">{gb(mt.get("octets"))}<div class="mut">{"подключён" if mt.get("curr") else "—"}</div></td>'
             f'<td><button class="btn sm" onclick="copyText({esc(json.dumps(invite_text(u), ensure_ascii=False))}, this)">Копировать</button>'
@@ -1044,7 +1100,8 @@ def render_admin(msg=None, err=None, hl=None, role="u", gfilter=None):
 <tr><th>Пользователь</th><th>Группа</th><th>Статус</th><th>До</th><th class="hide-sm">Happ/Hiddify<br><span class="mut">трафик · активность</span></th>
 <th class="hide-sm">Amnezia<br><span class="mut">трафик* · активность</span></th><th class="hide-sm">Telegram<br><span class="mut">трафик* · сейчас</span></th><th>Действия</th></tr>
 {rows or '<tr><td colspan="8" class="mut">Пока никого нет</td></tr>'}
-</table></div><p class="note">* трафик Amnezia и Telegram считается с последнего перезапуска службы. «+1 год» продлевает от текущей даты окончания.</p></div>
+</table></div><p class="note">* трафик Amnezia и Telegram считается с последнего перезапуска службы. «+1 год» продлевает от текущей даты окончания.
+«RU через сервер» — у пользователя российские сайты идут через сервер, а не напрямую: в Hiddify не выбран регион «Россия» (шаг 3 на его странице), в Happ не включена маршрутизация GeoVPN. Проверка раз в 10 минут, метка держится 3 дня.</p></div>
 </div>"""
     return page(f"{BRAND} — управление", body)
 
@@ -1179,8 +1236,10 @@ def render_user(u, client_ip):
     tg_link, _ = mt_links(u)
     android_note = '<p class="note">На Android при установке файла появится предупреждение о неизвестном источнике — это нормально, приложение скачивается с нашего сервера, а не из Google Play.</p>'
 
-    happ = option("happ", "H", "#3866ff", "Happ", '<span class="badge">Альтернатива</span>',
-        "Такой же VPN, но другое приложение. Выберите, если Hiddify не устанавливается или работает нестабильно. Российские сайты открываются напрямую, остальное — через VPN.",
+    # Happ first: it takes the routing profile from the subscription (RU sites straight from the device, updated by us);
+    # Hiddify accepts no rules from a subscription - the user has to set the region by hand (cli.happ_routing)
+    happ = option("happ", "H", "#3866ff", "Happ", '<span class="badge rec">Рекомендуем</span>',
+        "Основной вариант. Российские сайты (банки, Госуслуги, Avito) открываются напрямую, остальное — через VPN. Ничего настраивать не нужно: правила приходят с сервера и обновляются сами.",
         "Windows · Android · Mac · iPhone и iPad",
         step(1, "Установите приложение",
              f'<div class="dls">{dl("Happ-windows.exe", "Windows", "windows")}{dl("Happ-android.apk", "Android", "android")}'
@@ -1190,13 +1249,14 @@ def render_user(u, client_ip):
              connect_block(sub, "m", "happ-uri", sub, f'<a class="btn" href="happ://add/{esc(sub)}">Открыть в Happ</a>',
                            "Кнопка сама добавит подключение в Happ. Или отсканируйте QR-код в приложении (кнопка «+» → QR), или скопируйте ссылку и добавьте её из буфера обмена:"))
         + step(3, "Подключитесь",
-             '<ol><li>В списке выберите сервер <b>RU MSK Reality</b> и нажмите большую кнопку подключения.</li>'
+             '<ol><li>Если Happ спросит про профиль маршрутизации <b>GeoVPN</b> — согласитесь: с ним российские сайты работают напрямую.</li>'
+             '<li>В списке выберите сервер <b>RU MSK Reality</b> и нажмите большую кнопку подключения.</li>'
              '<li>Если соединение нестабильно — выберите <b>RU MSK Hysteria2</b>.</li>'
              '<li>Для игр на Windows включите режим «Системный прокси» — игры пойдут мимо VPN. На Android игры можно исключить в «Раздельном туннелировании».</li></ol>'
              '<p class="note">Настройки обновляются сами: если на сервере что-то изменится, приложение получит это автоматически.</p>'))
 
-    hiddify = option("hiddify", "Hi", "#6d4aff", "Hiddify", '<span class="badge rec">Рекомендуем</span>',
-        "Основной вариант. Сам выбирает самый быстрый способ подключения; российские сайты при этом открываются напрямую, остальное — через VPN.",
+    hiddify = option("hiddify", "Hi", "#6d4aff", "Hiddify", '<span class="badge">Альтернатива</span>',
+        "Если Happ не подходит. Сам выбирает самый быстрый способ подключения. Нужно один раз настроить регион и DNS (шаг 3), иначе российские сайты пойдут через VPN и некоторые (Avito, банки) не откроются.",
         "Windows · Android · Mac · iPhone и iPad",
         step(1, "Установите приложение",
              f'<div class="dls">{dl("Hiddify-windows.exe", "Windows", "windows")}{dl("Hiddify-android.apk", "Android", "android")}'
@@ -1207,9 +1267,15 @@ def render_user(u, client_ip):
         + step(2, "Добавьте подключение",
              connect_block(sub_named, "m", "hid-uri", sub_named, f'<a class="btn" href="hiddify://import/{esc(sub_named)}">Открыть в Hiddify</a>',
                            "Кнопка сама добавит подключение в Hiddify. Или в приложении нажмите «Добавить профиль» и отсканируйте QR-код / вставьте ссылку:"))
-        + step(3, "Подключитесь",
-             '<ol><li>При первом запуске выберите регион <b>Russia</b> — российские сайты будут работать напрямую.</li>'
-             '<li>Нажмите большую кнопку подключения. Если соединение нестабильно — выберите в списке <b>RU MSK Hysteria2</b>.</li></ol>'))
+        # labels as in Hiddify 4.1.1 (assets/translations/ru.i18n.json); DoH by IP: works where port 53 is blocked
+        + step(3, "Настройте один раз и подключитесь",
+             '<ol><li><b>Настройки → Маршрутизация → Регион</b>: выберите <b>Россия (ru)</b>. '
+             '<b>Обязательно</b> — без этого банки, Госуслуги и Avito пойдут через VPN и могут не открыться.</li>'
+             '<li>Там же <b>Маршрут IPv6</b>: <b>Включить</b> — иначе на некоторых Wi-Fi часть приложений (например, Instagram) пойдёт мимо VPN и не будет работать.</li>'
+             '<li><b>Настройки → DNS → Распознаватель исходящего сервера (напрямую)</b>: впишите '
+             '<code style="display:inline;padding:1px 6px">https://77.88.8.8/dns-query</code> — так интернет будет работать и в сетях, где закрыт обычный DNS (гостиницы, офисы).</li>'
+             '<li>Нажмите большую кнопку подключения. Если соединение нестабильно — выберите в списке <b>RU MSK Hysteria2</b>.</li></ol>'
+             '<p class="note">Если Wi-Fi просит войти через страницу (гостиница, кафе, метро) — отключите VPN, войдите, затем включите снова.</p>'))
 
     amnezia = option("amnezia", "A", "#0f9d74", "Amnezia", '<span class="badge">Другой протокол</span>',
         "Принципиально другой протокол (AmneziaWG), не связанный с Hiddify и Happ. Может работать, когда они не подключаются — например, если их блокирует провайдер, мобильная сеть или сеть на работе.",
@@ -1226,7 +1292,9 @@ def render_user(u, client_ip):
                            "Откройте скачанный файл в Amnezia. Или в приложении нажмите «+» и отсканируйте QR-код / вставьте ссылку:"))
         + step(3, "Подключитесь",
              '<ol><li>Нажмите «Подключиться».</li>'
-             '<li>Игры и отдельные приложения можно пустить мимо VPN в разделе «Раздельное туннелирование».</li></ol>'))
+             '<li>Игры и отдельные приложения можно пустить мимо VPN в разделе «Раздельное туннелирование».</li></ol>'
+             '<p class="note">В Amnezia через VPN идёт всё, в том числе российские сайты — а Avito и некоторые банки не пускают с адреса сервера. '
+             'Для них отключайте VPN или добавьте их в «Раздельное туннелирование». Если такое мешает — выберите Happ.</p>'))
 
     telegram = option("telegram", "✈", "#229ed9", "Только Telegram", '<span class="badge tg">Не VPN</span>',
         "Прокси, чтобы Telegram работал без включённого VPN. Другие сайты и приложения он не открывает. Если у вас уже работает VPN — это не нужно.",
@@ -1243,8 +1311,8 @@ def render_user(u, client_ip):
 
     body = head + f"""<div class="card intro">Здесь всё для подключения к VPN: заблокированные сайты и сервисы откроются,
 а российские продолжат работать напрямую.<br><b>Достаточно одного приложения.</b> Выберите вариант ниже —
-откроется пошаговая инструкция. Не знаете, что выбрать, — берите <b>Hiddify</b>.</div>
-<div class="opts">{hiddify}{happ}{amnezia}{telegram}</div>
+откроется пошаговая инструкция. Не знаете, что выбрать, — берите <b>Happ</b>.</div>
+<div class="opts">{happ}{hiddify}{amnezia}{telegram}</div>
 <div class="card"><div class="hint" style="margin:0">Доступ действует до <b>{fmt_date(r.get("expireAt"))}</b>.</div>
 <div class="warn" style="margin-top:10px"><b>Страница является персональной.</b>
 Подключиться по ней может любой, кто получит ссылку — пароль не запрашивается.<br>
