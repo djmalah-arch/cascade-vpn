@@ -9,7 +9,7 @@
   docker exec geovpn-portal geovpn geo-update            # refresh geoip/geosite on MSK now (normally weekly)
   docker exec geovpn-portal geovpn status
 """
-import base64, hashlib, json, os, secrets, sys
+import base64, hashlib, json, os, secrets, sys, time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import app  # noqa: E402  (config, Remnawave API helper, portal db)
@@ -20,7 +20,9 @@ def happ_routing():
     profile = {
         "Name": app.BRAND, "GlobalProxy": "true",
         "RemoteDNSType": "DoH", "RemoteDNSDomain": "https://dns.google/dns-query", "RemoteDNSIP": "8.8.8.8",
-        "DomesticDNSType": "DoU", "DomesticDNSDomain": "", "DomesticDNSIP": "77.88.8.8",
+        # DoH, not plain UDP: hotel/office Wi-Fi often blocks outside port 53 -> no RU sites and no server address
+        "DomesticDNSType": "DoH", "DomesticDNSDomain": "https://common.dot.dns.yandex.net/dns-query",
+        "DomesticDNSIP": "77.88.8.8",
         "Geoipurl": "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat",
         "Geositeurl": "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat",
         "DnsHosts": {},
@@ -31,6 +33,8 @@ def happ_routing():
         # YouTube via MSK: RU IP (no ads) + DPI bypass there
         "ProxySites": ["geosite:youtube"], "ProxyIp": [], "BlockSites": [], "BlockIp": [],
         "DomainStrategy": "IPIfNonMatch", "FakeDNS": "false",
+        # Happ re-applies a same-name profile on subscription update only when this unix time grows
+        "LastUpdated": str(int(time.time())),
     }
     link = "happ://routing/onadd/" + base64.b64encode(json.dumps(profile, separators=(",", ":")).encode()).decode()
     s = app.rw("GET", "/api/subscription-settings")
