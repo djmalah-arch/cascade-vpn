@@ -1035,6 +1035,7 @@ def render_admin(msg=None, err=None, hl=None, role="u", gfilter=None):
             f'<td>{group_cell(slug, u)}</td>'
             f'<td><span class="pill {spill[0]}">{spill[1]}</span>{" <span class=\"pill on\">online</span>" if online else ""}{ru_warn}</td>'
             f'<td><span class="{exp_cls}">{fmt_date(exp)}</span></td>'
+            f'<td><span class="mut">{fmt_date(parse_ts(u.get("created")))}</span></td>'
             f'<td class="hide-sm">{gb(tr.get("lifetimeUsedTrafficBytes"))}<div class="mut">{ago(on_rw)}</div>'
             f'{f"<div class=mut>{esc(app_)}</div>" if app_ else ""}</td>'
             f'<td class="hide-sm">{gb((a.get("rx") or 0) + (a.get("tx") or 0))}<div class="mut">{ago(hs)}</div></td>'
@@ -1078,23 +1079,30 @@ def render_admin(msg=None, err=None, hl=None, role="u", gfilter=None):
                      + "".join(f'<option value="/admin?g={quote(g)}"{" selected" if g == gfilter else ""}>{esc(g)} · {counts[g]}</option>'
                                for g in groups)
                      + '</select></div>')
-    sorts = (("created", "сначала новые"), ("name", "по имени"), ("st", "по статусу"), ("exp", "по дате окончания"))
-    group_tabs = (f'<div class="row" style="margin-bottom:12px">{group_sel}<span class="mut">Сортировка:</span><div style="width:220px">'
-                  f'<select id="usort" style="{SEL}" onchange="sortUsers(this.value)">'
-                  + "".join(f'<option value="{k}">{t}</option>' for k, t in sorts) + '</select></div></div>'
-                  """<script>
-function sortUsers(k) {
-  try { localStorage.setItem("gvSort", k); } catch (e) {}
-  const by = (f) => (a, b) => f(a).localeCompare(f(b), "ru") || a.dataset.name.localeCompare(b.dataset.name, "ru");
-  const cmp = {created: (a, b) => b.dataset.created.localeCompare(a.dataset.created),
-               name: by(r => r.dataset.name), st: by(r => r.dataset.st), exp: by(r => r.dataset.exp)}[k];
-  if (!cmp) return;
+    group_tabs = (f'<div class="row" style="margin-bottom:12px">{group_sel}</div>' if group_sel else "") + """<style>
+#utab th.srt { cursor: pointer; user-select: none; white-space: nowrap; }
+#utab th.srt:hover { color: #fff; }
+#utab th.srt::after { content: " \\2195"; opacity: .35; }
+#utab th.srt[data-dir="asc"]::after { content: " \\25B2"; opacity: 1; }
+#utab th.srt[data-dir="desc"]::after { content: " \\25BC"; opacity: 1; }
+</style><script>
+// click a column header to sort (again - reverse); default: newest first; choice remembered in the browser
+function sortUsers(k, dir) {
+  const th = document.querySelector('#utab th[data-k="' + k + '"]');
+  if (!th) return;
+  if (!dir) dir = th.dataset.dir === "asc" ? "desc" : "asc";
+  try { localStorage.setItem("gvSort", k + ":" + dir); } catch (e) {}
+  const s = dir === "asc" ? 1 : -1;
   const rows = [...document.querySelectorAll("#utab tr[data-name]")];
-  rows.sort(cmp).forEach(r => r.parentNode.appendChild(r));
-  document.getElementById("usort").value = k;
+  rows.sort((a, b) => s * a.dataset[k].localeCompare(b.dataset[k], "ru") || a.dataset.name.localeCompare(b.dataset.name, "ru"))
+      .forEach(r => r.parentNode.appendChild(r));
+  document.querySelectorAll("#utab th[data-k]").forEach(h => { h.dataset.dir = h === th ? dir : ""; });
 }
-document.addEventListener("DOMContentLoaded", () => { let k; try { k = localStorage.getItem("gvSort"); } catch (e) {} if (k) sortUsers(k); });
-</script>""")
+document.addEventListener("DOMContentLoaded", () => {
+  let v; try { v = localStorage.getItem("gvSort"); } catch (e) {}
+  if (v && v.includes(":")) sortUsers(...v.split(":"));
+});
+</script>"""
     body = f"""<div class="wrap">
 <h1>{BRAND} — управление</h1>
 <div class="sub">Пользователей{"" if is_admin and not gfilter else " в группе " + esc(gfilter)}: {len(visible)} · сейчас online: {total_online} · обновлено {m["ts"].astimezone(dt.timezone(dt.timedelta(hours=3))).strftime("%H:%M:%S")} МСК ·
@@ -1120,9 +1128,11 @@ document.addEventListener("DOMContentLoaded", () => { let k; try { k = localStor
 <div class="card"><h2>Сервер MSK</h2>{host}</div>
 </div></details>
 <div class="card"><h2>Пользователи</h2>{group_tabs}<div class="scroll"><table id="utab">
-<tr><th>Пользователь</th><th>Группа</th><th>Статус</th><th>До</th><th class="hide-sm">Happ/Hiddify<br><span class="mut">трафик · активность</span></th>
+<tr><th class="srt" data-k="name" onclick="sortUsers('name')">Пользователь</th><th>Группа</th>
+<th class="srt" data-k="st" onclick="sortUsers('st')">Статус</th><th class="srt" data-k="exp" onclick="sortUsers('exp')">До</th>
+<th class="srt" data-k="created" data-dir="desc" onclick="sortUsers('created')">Создан</th><th class="hide-sm">Happ/Hiddify<br><span class="mut">трафик · активность</span></th>
 <th class="hide-sm">Amnezia<br><span class="mut">трафик* · активность</span></th><th class="hide-sm">Telegram<br><span class="mut">трафик* · сейчас</span></th><th>Действия</th></tr>
-{rows or '<tr><td colspan="8" class="mut">Пока никого нет</td></tr>'}
+{rows or '<tr><td colspan="9" class="mut">Пока никого нет</td></tr>'}
 </table></div><p class="note">* трафик Amnezia и Telegram считается с последнего перезапуска службы. «+1 год» продлевает от текущей даты окончания.
 «RU через сервер» — у пользователя российские сайты идут через сервер, а не напрямую: в Hiddify не выбран регион «Россия» (шаг 3 на его странице), в Happ не включена маршрутизация GeoVPN. Проверка раз в 10 минут, метка держится 3 дня.</p></div>
 </div>"""
