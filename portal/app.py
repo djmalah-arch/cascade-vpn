@@ -28,7 +28,7 @@ def _site():
     """Per-installation settings (written by the installer): geovpn.env"""
     out = {}
     try:
-        for line in open(SITE_ENV, encoding="utf-8"):
+        for line in open(SITE_ENV, encoding="utf-8", errors="replace"):   # a broken byte must not stop the portal
             if "=" in line and not line.lstrip().startswith("#"):
                 k, v = line.strip().split("=", 1)
                 out[k.strip()] = v.strip().strip('"')
