@@ -63,6 +63,7 @@ class UserError(RuntimeError):
 
 
 MOD_GROUP = "work"          # the only group a moderator sees and creates users in
+ADMIN_GROUP = "main"        # group the admin's user list opens with
 DEFAULT_GROUP = "general"   # users created before groups existed
 
 
@@ -978,11 +979,13 @@ def render_admin(msg=None, err=None, hl=None, role="u", gfilter=None):
     host += (f'<div class="kv"><span>Копия на выходе</span><span>'
              f'{pill(ot and (now_utc() - ot).days < 2, esc(off.get("server", "")) + ", " + ago(ot), "нет" if not ot else ago(ot))}</span></div>')
 
-    # users (moderator: only MOD_GROUP; admin: all or the selected group)
+    # users (moderator: only MOD_GROUP; admin: ADMIN_GROUP by default, ?g=all for everyone)
     is_admin = role == "a"
     groups = sorted({ugroup(x) for x in db["users"].values()} | {MOD_GROUP})
     if not is_admin:
         gfilter = MOD_GROUP
+    elif gfilter is None and ADMIN_GROUP in groups:
+        gfilter = ADMIN_GROUP
     elif gfilter not in groups:
         gfilter = None
     visible = {s: x for s, x in db["users"].items() if not gfilter or ugroup(x) == gfilter}
@@ -1023,8 +1026,11 @@ def render_admin(msg=None, err=None, hl=None, role="u", gfilter=None):
             f'<form method="post" action="/admin/u/{esc(slug)}/{a_}" style="display:inline"'
             f'{" onsubmit=" + chr(34) + "return confirm(" + esc(json.dumps(conf)) + ")" + chr(34) if conf else ""}>'
             f'<button class="btn sm {cls}">{label}</button></form>')
+        # sort keys for the client-side ordering (status: online first, disabled last)
+        st_rank = (0 if online else 1) if is_active else {"LIMITED": 2, "EXPIRED": 3, "DISABLED": 4}.get(stt, 5)
         rows += (
-            f'<tr class="{"hl" if slug == hl else ""}"><td><div class="nm">{esc(u["name"])}</div>'
+            f'<tr class="{"hl" if slug == hl else ""}" data-name="{esc(u["name"].lower())}" data-created="{esc(u.get("created") or "")}"'
+            f' data-exp="{exp.isoformat() if exp else "9999"}" data-st="{st_rank}"><td><div class="nm">{esc(u["name"])}</div>'
             f'<div class="mut">{esc(slug)}</div></td>'
             f'<td>{group_cell(slug, u)}</td>'
             f'<td><span class="pill {spill[0]}">{spill[1]}</span>{" <span class=\"pill on\">online</span>" if online else ""}{ru_warn}</td>'
@@ -1064,14 +1070,31 @@ def render_admin(msg=None, err=None, hl=None, role="u", gfilter=None):
                f'бэкап {ago(bk)}</span>')
     SEL = ('font:inherit;color:#e8e8e8;background:#0e1015;border:1px solid #343a48;border-radius:8px;'
            'padding:8px 10px;width:100%')
-    group_tabs = ""
+    group_sel = ""
     if is_admin:
-        group_tabs = ('<div class="row" style="margin-bottom:12px"><span class="mut">Группа:</span><div style="width:240px">'
-                      f'<select style="{SEL}" onchange="location.href=this.value">'
-                      + f'<option value="/admin"{"" if gfilter else " selected"}>все группы · {len(db["users"])}</option>'
-                      + "".join(f'<option value="/admin?g={quote(g)}"{" selected" if g == gfilter else ""}>{esc(g)} · {counts[g]}</option>'
-                                for g in groups)
-                      + '</select></div></div>')
+        group_sel = ('<span class="mut">Группа:</span><div style="width:240px">'
+                     f'<select style="{SEL}" onchange="location.href=this.value">'
+                     + f'<option value="/admin?g=all"{"" if gfilter else " selected"}>все группы · {len(db["users"])}</option>'
+                     + "".join(f'<option value="/admin?g={quote(g)}"{" selected" if g == gfilter else ""}>{esc(g)} · {counts[g]}</option>'
+                               for g in groups)
+                     + '</select></div>')
+    sorts = (("created", "сначала новые"), ("name", "по имени"), ("st", "по статусу"), ("exp", "по дате окончания"))
+    group_tabs = (f'<div class="row" style="margin-bottom:12px">{group_sel}<span class="mut">Сортировка:</span><div style="width:220px">'
+                  f'<select id="usort" style="{SEL}" onchange="sortUsers(this.value)">'
+                  + "".join(f'<option value="{k}">{t}</option>' for k, t in sorts) + '</select></div></div>'
+                  """<script>
+function sortUsers(k) {
+  try { localStorage.setItem("gvSort", k); } catch (e) {}
+  const by = (f) => (a, b) => f(a).localeCompare(f(b), "ru") || a.dataset.name.localeCompare(b.dataset.name, "ru");
+  const cmp = {created: (a, b) => b.dataset.created.localeCompare(a.dataset.created),
+               name: by(r => r.dataset.name), st: by(r => r.dataset.st), exp: by(r => r.dataset.exp)}[k];
+  if (!cmp) return;
+  const rows = [...document.querySelectorAll("#utab tr[data-name]")];
+  rows.sort(cmp).forEach(r => r.parentNode.appendChild(r));
+  document.getElementById("usort").value = k;
+}
+document.addEventListener("DOMContentLoaded", () => { let k; try { k = localStorage.getItem("gvSort"); } catch (e) {} if (k) sortUsers(k); });
+</script>""")
     body = f"""<div class="wrap">
 <h1>{BRAND} — управление</h1>
 <div class="sub">Пользователей{"" if is_admin and not gfilter else " в группе " + esc(gfilter)}: {len(visible)} · сейчас online: {total_online} · обновлено {m["ts"].astimezone(dt.timezone(dt.timedelta(hours=3))).strftime("%H:%M:%S")} МСК ·
@@ -1096,7 +1119,7 @@ def render_admin(msg=None, err=None, hl=None, role="u", gfilter=None):
 <div class="card"><h2>Службы MSK</h2>{svc}</div>
 <div class="card"><h2>Сервер MSK</h2>{host}</div>
 </div></details>
-<div class="card"><h2>Пользователи</h2>{group_tabs}<div class="scroll"><table>
+<div class="card"><h2>Пользователи</h2>{group_tabs}<div class="scroll"><table id="utab">
 <tr><th>Пользователь</th><th>Группа</th><th>Статус</th><th>До</th><th class="hide-sm">Happ/Hiddify<br><span class="mut">трафик · активность</span></th>
 <th class="hide-sm">Amnezia<br><span class="mut">трафик* · активность</span></th><th class="hide-sm">Telegram<br><span class="mut">трафик* · сейчас</span></th><th>Действия</th></tr>
 {rows or '<tr><td colspan="8" class="mut">Пока никого нет</td></tr>'}
@@ -1250,8 +1273,8 @@ def render_user(u, client_ip):
                            "Кнопка сама добавит подключение в Happ. Или отсканируйте QR-код в приложении (кнопка «+» → QR), или скопируйте ссылку и добавьте её из буфера обмена:"))
         + step(3, "Подключитесь",
              '<ol><li>Если Happ спросит про профиль маршрутизации <b>GeoVPN</b> — согласитесь: с ним российские сайты работают напрямую.</li>'
-             '<li>В списке выберите сервер <b>RU MSK Reality</b> и нажмите большую кнопку подключения.</li>'
-             '<li>Если соединение нестабильно — выберите <b>RU MSK Hysteria2</b>.</li>'
+             '<li>В списке выберите <b>GeoVPN авто</b> и нажмите большую кнопку подключения. Happ сам выбирает лучший способ подключения '
+             'и переключается, если один не работает в этой сети (например, на Wi-Fi, где его режут).</li>'
              '<li>Для игр на Windows включите режим «Системный прокси» — игры пойдут мимо VPN. На Android игры можно исключить в «Раздельном туннелировании».</li></ol>'
              '<p class="note">Настройки обновляются сами: если на сервере что-то изменится, приложение получит это автоматически.</p>'))
 
@@ -1274,7 +1297,7 @@ def render_user(u, client_ip):
              '<li>Там же <b>Маршрут IPv6</b>: <b>Включить</b> — иначе на некоторых Wi-Fi часть приложений (например, Instagram) пойдёт мимо VPN и не будет работать.</li>'
              '<li><b>Настройки → DNS → Распознаватель исходящего сервера (напрямую)</b>: впишите '
              '<code style="display:inline;padding:1px 6px">https://77.88.8.8/dns-query</code> — так интернет будет работать и в сетях, где закрыт обычный DNS (гостиницы, офисы).</li>'
-             '<li>Нажмите большую кнопку подключения. Если соединение нестабильно — выберите в списке <b>RU MSK Hysteria2</b>.</li></ol>'
+             '<li>Нажмите большую кнопку подключения — Hiddify сам выберет работающий сервер.</li></ol>'
              '<p class="note">Если Wi-Fi просит войти через страницу (гостиница, кафе, метро) — отключите VPN, войдите, затем включите снова.</p>'))
 
     amnezia = option("amnezia", "A", "#0f9d74", "Amnezia", '<span class="badge">Другой протокол</span>',

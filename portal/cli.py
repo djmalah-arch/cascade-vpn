@@ -54,7 +54,6 @@ def happ_routing():
 
 
 HAPP_AUTO_TEMPLATE, HAPP_AUTO_HOST = "GeoVPN Happ auto", "GeoVPN авто"
-PILOT_HEADER = "x-geovpn-json"     # set by Caddy for pilot subscriptions -> XRAY_JSON (Happ auto-switch)
 
 
 def happ_auto():
@@ -122,14 +121,14 @@ def happ_auto():
     for h in (hy2, reality):
         if h.get("excludeFromSubscriptionTypes") != ["XRAY_JSON"]:
             app.rw("PATCH", "/api/hosts", {"uuid": h["uuid"], "excludeFromSubscriptionTypes": ["XRAY_JSON"]})
-    # requests carrying PILOT_HEADER get XRAY_JSON (rule must precede the base64 fallback)
+    # Happ gets XRAY_JSON (rule must precede the base64 fallback)
     s = app.rw("GET", "/api/subscription-settings")
     rr = s["responseRules"]
     rules = [r for r in rr["rules"] if r.get("name") != "Happ JSON (GeoVPN)"]
     rules.insert(next(i for i, r in enumerate(rules) if r["responseType"] == "XRAY_BASE64"), {
         "name": "Happ JSON (GeoVPN)", "enabled": True, "operator": "AND", "responseType": "XRAY_JSON",
-        "description": "Happ with auto-switch Hysteria2/Reality (header set by Caddy)",
-        "conditions": [{"headerName": PILOT_HEADER, "operator": "EQUALS", "value": "1", "caseSensitive": True}]})
+        "description": "Happ: 'GeoVPN авто' with auto-switch Hysteria2/Reality (geovpn happ-auto)",
+        "conditions": [{"headerName": "user-agent", "operator": "REGEX", "value": "^happ/", "caseSensitive": False}]})
     app.rw("PATCH", "/api/subscription-settings", {"uuid": s["uuid"], "responseRules": {**rr, "rules": rules}})
     print("happ auto (JSON + balancer): ok")
 
