@@ -53,6 +53,12 @@ ask SERVER_IP "Публичный IPv4 этого сервера" "$DETECTED_IP"
 ask DOMAIN "Домен входного сервера (A-запись -> $SERVER_IP)" ""
 [ -n "$DOMAIN" ] || die "домен обязателен (для теста можно ${SERVER_IP//./-}.sslip.io)"
 ask BRAND "Название сервиса (видно пользователям)" "GeoVPN"
+# a terminal not in UTF-8 (or backspace over a Cyrillic letter) leaves broken bytes -> portal can't start
+while ! printf '%s' "$BRAND" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1; do
+  c_warn "название содержит символы не в UTF-8 (кодировка терминала?) — введите заново или латиницей"
+  [ -t 0 ] || die "BRAND не в UTF-8"
+  BRAND=; ask BRAND "Название сервиса (видно пользователям)" "GeoVPN"
+done
 ask RW_ADMIN_USER "Логин администратора панели Remnawave" "geoadmin"
 # re-run: keep passwords that were already set
 if [ -f "$DATA/portal/secrets.env" ]; then
