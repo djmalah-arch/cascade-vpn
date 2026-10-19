@@ -104,8 +104,29 @@ net.ipv4.tcp_congestion_control = bbr
 net.core.rmem_max = 16777216
 net.core.wmem_max = 16777216
 net.ipv4.ip_forward = 1
+net.ipv4.tcp_mtu_probing = 1
 EOF
 sysctl --system >/dev/null
+# fail2ban: SSH password guessing (thousands of attempts a day). 5 wrong passwords in 10 min -> ban 1 h, repeaters up to a week
+if ! command -v fail2ban-client >/dev/null; then
+  { apt-get update -qq && apt-get install -y -qq fail2ban python3-systemd; } >/dev/null 2>&1 || c_warn "fail2ban не установлен"
+fi
+if command -v fail2ban-client >/dev/null; then
+  mkdir -p /etc/fail2ban/jail.d
+  cat > /etc/fail2ban/jail.d/geovpn.local <<'EOF'
+[sshd]
+enabled = true
+backend = systemd
+journalmatch = _COMM=sshd + _COMM=sshd-session
+maxretry = 5
+findtime = 10m
+bantime = 1h
+bantime.increment = true
+bantime.maxtime = 1w
+ignoreip = 127.0.0.1/8 ::1
+EOF
+  systemctl enable -q fail2ban 2>/dev/null; systemctl restart fail2ban || c_warn "fail2ban не запустился"
+fi
 # systemd-networkd must not flush "foreign" policy rules/routes (AmneziaWG TPROXY rule) when it restarts on upgrades
 if systemctl is-active -q systemd-networkd; then
   mkdir -p /etc/systemd/networkd.conf.d

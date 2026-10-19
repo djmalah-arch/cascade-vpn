@@ -95,6 +95,74 @@ def install_fw_key(c):
     return o.read().decode().strip() == "ok"
 
 
+BACKUP_KEY = C.P("ssh/geovpn_backup", "/root/.ssh/geovpn_backup")  # restricted key: can only store an MSK backup on an exit
+
+
+def backup_pubkey():
+    if not os.path.exists(BACKUP_KEY):
+        os.makedirs(os.path.dirname(BACKUP_KEY), mode=0o700, exist_ok=True)
+        C.sh(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "geovpn-portal-backup", "-f", BACKUP_KEY])
+    return open(BACKUP_KEY + ".pub").read().strip()
+
+
+# Host settings of an exit, outside the node's docker (safe to re-run, doesn't touch other VPNs on the server):
+#  - fail2ban for SSH: every server gets thousands of password guesses a day;
+#  - tcp_mtu_probing: path MTU MSK <-> exits is 1450, PMTU black holes must not stall connections;
+#  - receiver of MSK backups (the portal copies its daily backup to the lowest-priority exit).
+HOST_EXTRAS = r"""
+export DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1
+touch /etc/sysctl.d/99-geovpn.conf
+grep -q tcp_mtu_probing /etc/sysctl.d/99-geovpn.conf || echo "net.ipv4.tcp_mtu_probing = 1" >> /etc/sysctl.d/99-geovpn.conf
+sysctl -q -w net.ipv4.tcp_mtu_probing=1 && echo "mtu probing: on"
+command -v fail2ban-client >/dev/null || { apt-get update -qq && apt-get install -y -qq fail2ban python3-systemd; } >/dev/null 2>&1
+if command -v fail2ban-client >/dev/null; then
+  mkdir -p /etc/fail2ban/jail.d
+  cat > /etc/fail2ban/jail.d/geovpn.local <<'X'
+# GeoVPN: SSH brute force. 5 wrong passwords in 10 min -> ban 1 h, repeat offenders up to a week. MSK is never banned.
+[sshd]
+enabled = true
+backend = systemd
+journalmatch = _COMM=sshd + _COMM=sshd-session
+maxretry = 5
+findtime = 10m
+bantime = 1h
+bantime.increment = true
+bantime.maxtime = 1w
+ignoreip = 127.0.0.1/8 ::1 __MSK4__ __MSK6__
+X
+  systemctl enable -q fail2ban 2>/dev/null; systemctl restart fail2ban && sleep 2 && fail2ban-client status sshd >/dev/null && echo "fail2ban: on"
+else
+  echo "fail2ban: не установлен (нет apt?)"
+fi
+cat > /usr/local/sbin/geovpn-backup-recv <<'X'
+#!/bin/bash
+# Forced command of the GeoVPN portal backup key (authorized_keys): only stores an MSK backup sent on stdin.
+d=/root/geovpn-backups
+n=${SSH_ORIGINAL_COMMAND#put }
+[[ $SSH_ORIGINAL_COMMAND == "put "* && $n =~ ^msk-[0-9]{8}-[0-9]{4}\.tar\.gz$ ]] || { echo denied; exit 1; }
+mkdir -p -m 700 $d
+if head -c 512M > "$d/.$n.part" && [ -s "$d/.$n.part" ]; then mv "$d/.$n.part" "$d/$n"; chmod 600 "$d/$n"
+else rm -f "$d/.$n.part"; echo failed; exit 1; fi
+ls -1t $d/msk-*.tar.gz | tail -n +31 | xargs -r rm -f
+echo "ok $(du -h "$d/$n" | cut -f1)"
+X
+chmod 755 /usr/local/sbin/geovpn-backup-recv
+mkdir -p /root/.ssh && touch /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys
+sed -i '\#__BKEY__#d' /root/.ssh/authorized_keys
+echo 'command="/usr/local/sbin/geovpn-backup-recv",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty __BKEYLINE__' >> /root/.ssh/authorized_keys
+echo "backup receiver: on"
+"""
+
+
+def host_extras(c, db, log=print):
+    """Run HOST_EXTRAS on an exit (open paramiko session as root). Failures here don't break the exit itself."""
+    v4, v6 = msk_addrs(db)
+    key = backup_pubkey()
+    script = (HOST_EXTRAS.replace("__MSK4__", v4 or "").replace("__MSK6__", v6 or "")
+              .replace("__BKEY__", key.split()[1]).replace("__BKEYLINE__", key))
+    return ssh_run(c, script, log, timeout=600)
+
+
 def push_msk_addrs(db, v4, v6, log=print):
     """Tell every exit's firewall the (new) MSK address, via the restricted key (IPv6 first: exits' IPv4 is often blocked)."""
     import paramiko
@@ -139,6 +207,86 @@ def dns_a(name):
         return sorted({a[4][0] for a in socket.getaddrinfo(name, 443, socket.AF_INET)})
     except OSError:
         return []
+
+
+DNS_CACHE = {}
+HOST_RX = re.compile(r"(?=.{4,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{1,62}")
+COMMON_LABELS = ("exit", "vpn", "node", "srv", "server", "connect", "proxy", "de", "nl", "fi", "at", "us")
+
+
+def norm_host(h):
+    h = (h or "").strip().lower().rstrip(".")
+    return h if HOST_RX.fullmatch(h) else ""
+
+
+def resolve(name, ttl=300):
+    """A and AAAA records of a hostname -> (v4 list, v6 list), cached for a few minutes."""
+    hit = DNS_CACHE.get(name)
+    if hit and hit[0] > time.time():
+        return hit[1]
+    res = []
+    for fam in (socket.AF_INET, socket.AF_INET6):
+        try:
+            res.append(sorted({a[4][0] for a in socket.getaddrinfo(name, None, fam, socket.SOCK_STREAM)}))
+        except OSError:
+            res.append([])
+    DNS_CACHE[name] = (time.time() + ttl, tuple(res))
+    return tuple(res)
+
+
+def remember_host(db, host):
+    """Hostnames ever used for exits: candidates for "which domain points here" after a server is deleted."""
+    if host:
+        kh = db.setdefault("known_hosts", [])
+        if host not in kh:
+            kh.append(host)
+            del kh[:-50]
+
+
+def host_candidates(db):
+    """DNS has no "names pointing to this IP" lookup: guess within the zones we know (our own hostnames,
+    their numbered siblings like geo-srv01 -> geo-srv02..20, and a few typical labels)."""
+    known = {h for h in [norm_host(MSK_DOMAIN)] + [norm_host(e.get("host")) for e in db.get("exits", {}).values()]
+             + [norm_host(h) for h in db.get("known_hosts", [])] if h}
+    cands = set(known)
+    for h in known:
+        label, _, zone = h.partition(".")
+        if "." not in zone:
+            continue
+        m = re.fullmatch(r"(.*?)(\d+)", label)
+        if m:
+            cands |= {f"{m.group(1)}{str(i).zfill(len(m.group(2)))}.{zone}" for i in range(1, 21)}
+        cands |= {f"{x}.{zone}" for x in COMMON_LABELS}
+    return sorted(cands)
+
+
+def names_for(ip, db=None):
+    """Domains (among the guessed candidates) whose A/AAAA point to ip, plus the PTR name if any."""
+    import ipaddress
+    want = ipaddress.ip_address(ip)
+    cands = host_candidates(db or C.load_db())
+    with ThreadPoolExecutor(max_workers=16) as ex:
+        res = dict(zip(cands, ex.map(resolve, cands)))
+    match = [h for h, (v4, v6) in res.items() if any(ipaddress.ip_address(a) == want for a in v4 + v6)]
+    try:
+        ptr = norm_host(socket.gethostbyaddr(ip)[0])
+    except OSError:
+        ptr = ""
+    return {"match": match, "ptr": ptr if ptr and ptr not in match else ""}
+
+
+def lookup(q):
+    """/admin/servers/lookup: ?host= -> its addresses, ?ip= -> domains pointing to it."""
+    if q.get("host"):
+        h = norm_host(q["host"])
+        if not h:
+            return {"error": "некорректный домен"}
+        v4, v6 = resolve(h, ttl=30)
+        return {"host": h, "v4": v4, "v6": v6}
+    ip = (q.get("ip") or "").strip()
+    if valid_ip(ip, 4) or valid_ip(ip, 6):
+        return {"ip": ip, **names_for(ip)}
+    return {"error": "укажите домен или IP"}
 
 
 def exits_sorted(db, only_enabled=False):
@@ -191,15 +339,12 @@ def out_tags(eid, e):
     return tags
 
 
-def dns_mismatch(e):
+def dns_mismatch(e, ttl=300):
     """Hostname set but its A records don't include the exit's IPv4 (stale DNS after an IP change) -> resolved list."""
     host, ip4 = e.get("host"), e.get("ip4")
     if not (host and ip4):
         return None
-    try:
-        addrs = sorted({a[4][0] for a in socket.getaddrinfo(host, None, socket.AF_INET)})
-    except OSError:
-        addrs = []
+    addrs = resolve(host, ttl)[0]
     return None if ip4 in addrs else addrs
 
 
@@ -227,6 +372,13 @@ def best_tag(eid, e):
     return tags[-1]  # IPv6 first when unknown: exits' IPv4 is the first thing RKN blocks
 
 
+# Users' domains are resolved on MSK for routing (geoip:ru, IPIfNonMatch) and for direct/YouTube connections.
+# DoH: queries are encrypted (the DPI of the Russian DC sees none of them) and cached by xray; plain system DNS
+# (127.0.0.53 -> 1.1.1.1/8.8.8.8) only as the last resort.
+MSK_DNS = {"servers": ["https+local://8.8.8.8/dns-query", "https+local://77.88.8.8/dns-query", "localhost"],
+           "queryStrategy": "UseIP"}
+
+
 def msk_profile(db, plan):
     st = state()
     K = st["keys"]["MSK"]
@@ -249,10 +401,18 @@ def msk_profile(db, plan):
         # MTProxy (Telegram) upstream: always abroad, Telegram is blocked in RU
         {"tag": "MTP_OUT", "listen": "127.0.0.1", "port": 10804, "protocol": "mixed", "settings": {"udp": False}},
     ]
-    outs = [{"tag": "direct", "protocol": "freedom"},
+    # direct: resolve through xray's DNS below (DoH, cached), not the host's plain-UDP resolver
+    outs = [{"tag": "direct", "protocol": "freedom", "settings": {"domainStrategy": "UseIPv4v6"}},
+            # same as direct, own tag for RU sites: the access log then shows whose RU traffic reaches MSK (app.routing_audit)
+            {"tag": "direct-ru", "protocol": "freedom", "settings": {"domainStrategy": "UseIPv4v6"}},
             # YouTube: MSK DC blocks it over IPv4 -> IPv6 first, IPv4 through zapret
             {"tag": "yt-dpi", "protocol": "freedom", "settings": {"domainStrategy": "ForceIPv6v4"}}]
-    bals, rules = [], [{"inboundTag": ["MON_YT"], "outboundTag": "yt-dpi"}]
+    # clients' plain DNS (Hiddify's remote DNS, AmneziaWG's 8.8.8.8...) is answered here by xray's DNS (DoH, cached):
+    # one round trip to MSK instead of a detour via an exit
+    outs.append({"tag": "dns-out", "protocol": "dns", "settings": {
+        "rules": [{"action": "hijack", "qtype": "1,28"}, {"action": "direct"}]}})   # A/AAAA answered here, the rest passes
+    bals, rules = [], [{"inboundTag": ["MON_YT"], "outboundTag": "yt-dpi"},
+                       {"inboundTag": ["MSK_REALITY", "MSK_HY2", "AWG_BRIDGE"], "port": "53", "outboundTag": "dns-out"}]
     for eid, e in exits_sorted(db):
         tags = out_tags(eid, e)
         if not tags:
@@ -273,7 +433,9 @@ def msk_profile(db, plan):
     primary = plan["primary"] or []
     have_exits = any(out_tags(i, e) for i, e in exits_sorted(db, True))
     if have_exits:
-        main = {"tag": "exits", "selector": [f"x-{i}-" for i in primary] or ["x-"], "strategy": {"type": "leastPing"}}
+        fam = plan.get("fam") or {}
+        main = {"tag": "exits", "selector": [f"x-{i}-{fam.get(i, '')}" for i in primary] or ["x-"],
+                "strategy": {"type": "leastPing"}}
         if plan.get("fallback"):
             main["fallbackTag"] = best_tag(plan["fallback"], db["exits"][plan["fallback"]])
         bals.insert(0, main)
@@ -288,14 +450,16 @@ def msk_profile(db, plan):
         rules += [{"domain": ["geosite:" + g for g in dj.get("geosite", [])] + ["domain:" + x for x in dj["domains"]],
                    "outboundTag": "direct"},
                   {"ip": dj["ips"], "outboundTag": "direct"}]
+        if dj.get("udp_ports"):       # game servers known only by port (hosted anywhere, e.g. War Thunder)
+            rules.append({"network": "udp", "port": ",".join(dj["udp_ports"]), "outboundTag": "direct"})
     except (OSError, ValueError, KeyError) as e:
         print("direct.json not applied:", e, flush=True)
     rules += [
               {"ip": ["geoip:private"], "outboundTag": "block"},
-              {"domain": ["geosite:category-ru"], "outboundTag": "direct"},
-              {"ip": ["geoip:ru"], "outboundTag": "direct"},
+              {"domain": ["geosite:category-ru"], "outboundTag": "direct-ru"},
+              {"ip": ["geoip:ru"], "outboundTag": "direct-ru"},
               dict({"network": "tcp,udp"}, **to_exits)]
-    return {"log": {"loglevel": "warning"}, "inbounds": inb, "outbounds": outs,
+    return {"log": {"loglevel": "warning"}, "inbounds": inb, "outbounds": outs, "dns": MSK_DNS,
             **({"burstObservatory": {"subjectSelector": ["x-"],
                                  "pingConfig": {"destination": "https://www.gstatic.com/generate_204",
                                                 "interval": "15s", "timeout": "8s", "sampling": 2}}} if have_exits else {}),
@@ -336,10 +500,15 @@ def keep_enabled(node_uuid, wait=8):
 
 # ---------------------------------------------------------------- probing / watchdog
 def probe_port(port):
+    """Channel check through a local inbound. Two unrelated targets: one flaky site must not make an exit "down"
+    (2026-09-29: api.ipify.org hangs -> Vienna and cold reserv "down" -> two needless xray restarts)."""
     t0 = time.time()
     rc, out = C.sh(["curl", "-s", "-m", "8", "--socks5-hostname", f"127.0.0.1:{port}", "https://api.ipify.org"])
-    ok = rc == 0 and bool(re.fullmatch(r"[0-9a-fA-F.:]+", out or ""))
-    return ok, int((time.time() - t0) * 1000), out if ok else None
+    if rc == 0 and re.fullmatch(r"[0-9a-fA-F.:]+", out or ""):
+        return True, int((time.time() - t0) * 1000), out
+    rc, code = C.sh(["curl", "-s", "-m", "8", "-o", "/dev/null", "-w", "%{http_code}", "--socks5-hostname",
+                     f"127.0.0.1:{port}", "https://www.gstatic.com/generate_204"])
+    return rc == 0 and code == "204", int((time.time() - t0) * 1000), None
 
 
 def probe_all(db):
@@ -352,10 +521,11 @@ def probe_all(db):
         for eid, (b, p4, p6) in jobs.items():
             ok, ms, ip = b.result()
             e = db["exits"][eid]
-            STATUS[eid] = {"ok": ok, "ms": ms, "ip": ip, "ts": C.now_utc(),
+            STATUS[eid] = {"ok": ok, "ms": ms, "ip": ip or (STATUS.get(eid, {}).get("ip") if ok else None), "ts": C.now_utc(),
                            "v4": p4.result()[0] if (e.get("host") or e.get("ip4")) else None,
                            "v6": p6.result()[0] if e.get("ip6") else None}
             c = COUNTERS.setdefault(eid, {"fail": 0, "ok": 0, "up": ok})
+            c["v6fail"] = c.get("v6fail", 0) + 1 if STATUS[eid]["v6"] is False else 0   # IPv6 bridge: failures in a row
             if ok:
                 c["ok"], c["fail"] = c["ok"] + 1, 0
                 if not c["up"] and c["ok"] >= OKS_TO_UP:
@@ -377,6 +547,11 @@ def is_up(eid):
     return COUNTERS.get(eid, {}).get("up", True)
 
 
+def v6_dead(eid):
+    """IPv6 bridge of an exit failed 3 probes in a row (~1.5 min): one lost probe must not rebuild the profile."""
+    return COUNTERS.get(eid, {}).get("v6fail", 0) >= FAILS_TO_DOWN + 1
+
+
 def compute_plan(db):
     en = exits_sorted(db, only_enabled=True)
     if not en:
@@ -389,12 +564,49 @@ def compute_plan(db):
         top = en[0][1]["priority"]
         primary = [i for i, e in en if e["priority"] == top]
     rest = [i for i, e in sorted(en, key=lambda kv: (not is_up(kv[0]), kv[1]["priority"])) if i not in primary]
-    return {"primary": primary, "fallback": rest[0] if rest else None,
+    # bridge family of the primaries: IPv6 wherever it works. Exits' IPv4 is what RKN degrades first
+    # (seen 2026-09-29: ~10% SYN loss and bursts of 8 s hangs MSK -> Vienna over IPv4, IPv6 clean);
+    # "" = both families, xray's leastPing chooses.
+    fam = {i: ("6" if db["exits"][i].get("ip6") and not v6_dead(i) else "") for i in primary}
+    return {"primary": primary, "fam": fam, "fallback": rest[0] if rest else None,
             "fb_tag": best_tag(rest[0], db["exits"][rest[0]]) if rest else None}
 
 
 def names(db, ids):
     return ", ".join(db["exits"][i]["name"] for i in ids if i in db["exits"]) or "—"
+
+
+def plan_works(plan):
+    """Does xray still have a live route with this plan? Its main balancer skips dead primaries by itself and takes
+    fallbackTag when all of them are down - no profile change needed (a change restarts xray: all users' connections drop)."""
+    if not plan:
+        return False
+    if any(is_up(i) for i in plan.get("primary") or []):
+        return True
+    fb, tag = plan.get("fallback"), plan.get("fb_tag") or ""
+    if not fb or not is_up(fb):
+        return False
+    return STATUS.get(fb, {}).get("v6" if tag.endswith("-6") else "v4") is not False
+
+
+def best_prio(db, ids):
+    return min((db["exits"][i]["priority"] for i in ids or [] if i in db["exits"]), default=10 ** 6)
+
+
+def must_switch(db, old, new):
+    """Rebuild the MSK profile only when the running one has no live route any more, or to return to
+    higher-priority exits after an outage. A dead primary alone is handled inside xray (fallbackTag)."""
+    if not old:
+        return True
+    if not plan_works(old):
+        return True
+    # the primary is pinned to IPv6 but that family died while IPv4 works: use IPv4 instead of the reserve
+    if any(f == "6" and is_up(i) and v6_dead(i) for i, f in (old.get("fam") or {}).items()):
+        return True
+    # plans from before the family pinning: move the primary to IPv6 once
+    if "fam" not in old and any(new.get("fam", {}).values()):
+        return True
+    return best_prio(db, new["primary"]) < best_prio(db, old.get("primary"))
 
 
 def heal_panel(nodes):
@@ -455,7 +667,15 @@ def watchdog_tick():
     probe_all(db)
     plan = compute_plan(db)
     old = db["balancer"].get("plan")
-    if plan != old:
+    degraded = bool(old) and plan != old and not any(is_up(i) for i in old.get("primary") or [])
+    if degraded != db["balancer"].get("degraded", False):
+        db["balancer"]["degraded"] = degraded
+        event(db, f"{names(db, old['primary'])} недоступен — трафик сам ушёл на резерв {names(db, [old['fallback']])} "
+                  "(без перезапуска)" if degraded else f"{names(db, (old or {}).get('primary') or [])} снова доступен")
+        with C.LOCK:
+            fresh = C.load_db(); fresh["balancer"] = db["balancer"]; C.save_db(fresh)
+    if plan != old and must_switch(db, old, plan):
+        db["balancer"]["degraded"] = False
         apply(db, plan)
         if not old or old.get("primary") != plan["primary"]:
             down = [i for i in (old or {}).get("primary", []) if not is_up(i)]
@@ -587,6 +807,7 @@ if docker ps -a --format '{{.Names}}' | grep -qxE '__NODE__|__FW__'; then echo "
 cat >/etc/sysctl.d/99-geovpn.conf <<'X'
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
+net.ipv4.tcp_mtu_probing = 1
 X
 sysctl --system >/dev/null 2>&1 || true
 # everything else lives in __DIR__ and runs in docker: xray node + firewall of the node API port (only MSK may connect)
@@ -688,7 +909,11 @@ else
   echo "в $D нет установки GeoVPN — ничего не удаляю"
 fi
 # the portal key stays while this MSK still has other nodes here
-docker ps -aq --filter label=geovpn.msk=__MSKID__ 2>/dev/null | grep -q . || sed -i '\#__KEY__#d' /root/.ssh/authorized_keys 2>/dev/null
+# ...and so do MSK's backups (they hold all secrets) with the key that writes them
+if ! docker ps -aq --filter label=geovpn.msk=__MSKID__ 2>/dev/null | grep -q .; then
+  sed -i -e '\#__KEY__#d' -e '\#__BKEY__#d' /root/.ssh/authorized_keys 2>/dev/null
+  rm -rf /root/geovpn-backups && echo "бэкапы MSK с сервера удалены"
+fi
 # older installs (before 2026-09-27): host-level firewall unit
 if [ -f /etc/systemd/system/geovpn-fw.service ]; then
   systemctl disable --now geovpn-fw >/dev/null 2>&1 || true
@@ -865,6 +1090,16 @@ def do_add(log, f):
     name = " ".join(f["name"].split())[:40]
     cc = (f.get("cc") or "").upper()[:2]
     ip4, ip6, host = f.get("ip4", "").strip(), f.get("ip6", "").strip(), f.get("host", "").strip()
+    if host and not norm_host(host):
+        raise C.UserError(f"некорректный домен: {host}")
+    host = norm_host(host)
+    from_dns = False
+    if host and not (ip4 or ip6):                # only a domain given: take its A/AAAA records
+        d4, d6 = resolve(host, ttl=0)
+        if not (d4 or d6):
+            raise C.UserError(f"домен {host} не резолвится — укажите IPv4 или IPv6 сервера")
+        ip4, ip6, from_dns = (d4[0] if d4 else ""), (d6[0] if d6 else ""), True
+        log(f"Адрес из DNS {host}: {ip4 or '—'} / {ip6 or '—'} (сверю с самим сервером после подключения)")
     ip4 = ip4 if valid_ip(ip4, 4) else ""
     ip6_try = [ip6] if valid_ip(ip6, 6) else []
     if not ip6_try and "/" in ip6:               # "2a12:…::/48" from the hoster panel: try typical host addresses
@@ -880,7 +1115,7 @@ def do_add(log, f):
     w = install_params(f)
     port = w["port"]
     if not name or not (ip4 or ip6) or not pw:
-        raise C.UserError("Нужны название, корректный IPv4 или IPv6-адрес сервера и root-пароль "
+        raise C.UserError("Нужны название, домен или корректный IPv4/IPv6-адрес сервера и root-пароль "
                            "(в поле IPv6 — адрес сервера, например 2a12:…::2, а не подсеть /48)")
     db = C.load_db()
     eid = re.sub(r"[^a-z0-9]", "", C.slugify(name))[:8] or "exit"
@@ -910,14 +1145,26 @@ def do_add(log, f):
                 errs.append(f"{target}: {ex}")
                 log(f"  не отвечает ({ex})")
         if not c:
-            raise RuntimeError("не удалось подключиться по SSH (" + "; ".join(errs) + "). Если IPv4 сервера "
-                               "заблокирован в РФ, укажите его IPv6-адрес (например 2a12:…::2) — портал подключится по нему")
+            raise RuntimeError("не удалось подключиться по SSH (" + "; ".join(errs) + "). " +
+                               (f"Адрес взят из DNS {host} — если IP сервера недавно сменился, DNS может ещё указывать на "
+                                "старый (обновление до суток): укажите IP вручную. " if from_dns else "") +
+                               "Если IPv4 сервера заблокирован в РФ, укажите его IPv6-адрес (например 2a12:…::2) — портал подключится по нему")
         d4, d6 = detect_addrs(c)
         if d6 and valid_ip(d6, 6) and d6 != ip6:
             log(f"  IPv6 сервера: {d6}" + (f" (в форме было {f.get('ip6')})" if f.get("ip6") else ""))
             ip6 = d6
-        if not ip4 and valid_ip(d4, 4) and not d4.startswith(("10.", "192.168.", "172.")):
+        d4_public = valid_ip(d4, 4) and not d4.startswith(("10.", "192.168.", "172."))
+        if d4_public and d4 != ip4 and (not ip4 or from_dns):
+            if ip4:
+                log(f"  IPv4 сервера: {d4} (DNS {host} указывает на {ip4} — устарел, беру адрес с сервера)")
             ip4 = d4
+        if not host and ip4:
+            found = names_for(ip4)["match"]
+            if len(found) == 1:
+                host = found[0]
+                log(f"  Домен сервера по DNS: {host}")
+            elif found:
+                log(f"  На этот IP указывают домены: {', '.join(found)} — домен не подставлен, укажите его в «Адрес…» при желании")
         dup = same_server(C.load_db(), ip4, ip6)
         if dup:
             raise C.UserError(f"этот сервер уже добавлен как «{dup}» (один вход может держать на сервере только одну свою ноду)")
@@ -929,7 +1176,7 @@ def do_add(log, f):
             for x in conflicts:
                 log("  занято: " + x)
             token = secrets.token_urlsafe(16)
-            PENDING[token] = {"f": {**f, "ip4": ip4, "ip6": ip6, "_ssh": ssh_target}, "sug": sug, "conflicts": conflicts, "exp": time.time() + 900}
+            PENDING[token] = {"f": {**f, "ip4": ip4, "ip6": ip6, "host": host, "_ssh": ssh_target}, "sug": sug, "conflicts": conflicts, "exp": time.time() + 900}
             log.job["confirm"] = token
             log("На сервере ничего не изменено. Проверьте предложенные значения ниже и подтвердите установку.")
             return
@@ -977,6 +1224,11 @@ def do_add(log, f):
             raise
         if install_fw_key(c):
             log("Ключ для автообновления адреса MSK в файрволе установлен.")
+        log("Защита SSH (fail2ban), настройки сети и приём бэкапов MSK…")
+        try:
+            host_extras(c, db, log)
+        except Exception as ex:
+            log(f"  не удалось: {ex} — на работу выхода это не влияет")
         time.sleep(5)
         if ip4 and tcp_ok(ip4, nport):
             log("Управление ноды: доступно по IPv4.")
@@ -988,10 +1240,11 @@ def do_add(log, f):
         with C.LOCK:
             db = C.load_db()
             db["exits"][eid] = e
+            remember_host(db, host)
             event(db, f"Добавлен сервер {name} (приоритет {prio})")
             C.save_db(db)
         created["db"] = True
-        bad = dns_mismatch(e)
+        bad = dns_mismatch(e, 0)
         if bad is not None:
             log(f"ВНИМАНИЕ: {host} указывает на {', '.join(bad) or 'ничего'}, а не на {ip4} — обновите A-запись (мост MSK всё равно идёт по IP; DNS может обновляться до суток).")
         log("Обновляю маршрутизацию MSK…")
@@ -1040,7 +1293,8 @@ def do_add(log, f):
 
 def remove_script(e):
     return (NODE_REMOVE.replace("__DIR__", nd(e, "node_dir")).replace("__FW__", nd(e, "fw_name"))
-            .replace("__PORT__", str(e.get("port", 443))).replace("__KEY__", portal_pubkey().split()[1]).replace("__MSKID__", msk_id()))
+            .replace("__PORT__", str(e.get("port", 443))).replace("__KEY__", portal_pubkey().split()[1]).replace("__MSKID__", msk_id())
+            .replace("__BKEY__", backup_pubkey().split()[1]))
 
 
 def do_delete(log, eid, pw):
@@ -1091,6 +1345,14 @@ def update_address(eid, form):
     """Exit server got a new IP: store it, point the Remnawave node and the MSK bridge to it. No reinstall."""
     import ipaddress
     ip4, ip6, host = form.get("ip4", "").strip(), form.get("ip6", "").strip(), form.get("host", "").strip()
+    if host and not norm_host(host):
+        raise RuntimeError(f"некорректный домен: {host}")
+    host = norm_host(host)
+    if host and not (ip4 or ip6):                # only a domain: take its current A/AAAA
+        d4, d6 = resolve(host, ttl=0)
+        if not (d4 or d6):
+            raise RuntimeError(f"домен {host} не резолвится — укажите IP")
+        ip4, ip6 = (d4[0] if d4 else ""), (d6[0] if d6 else "")
     if ip4 and not valid_ip(ip4, 4):
         raise RuntimeError(f"некорректный IPv4: {ip4}")
     cand6 = [ip6] if valid_ip(ip6, 6) else []
@@ -1110,6 +1372,7 @@ def update_address(eid, form):
             raise RuntimeError("сервер не найден")
         old = f"{e.get('ip4') or '—'} / {e.get('ip6') or '—'}"
         e["ip4"], e["ip6"], e["host"] = ip4, ip6, host
+        remember_host(db, host)
         event(db, f"{e['name']}: новый адрес {ip4 or '—'} / {ip6 or '—'} (был {old})")
         C.save_db(db)
     if ip4 and tcp_ok(ip4, np_):
@@ -1124,7 +1387,7 @@ def update_address(eid, form):
     with C.LOCK:
         fresh = C.load_db(); fresh["balancer"] = db["balancer"]; C.save_db(fresh)
     STATUS.pop(eid, None); COUNTERS.pop(eid, None)
-    bad = dns_mismatch(e)
+    bad = dns_mismatch(e, 0)
     dns = (f" Внимание: {host} указывает на {', '.join(bad) or 'ничего'}, а не на {ip4} — обновите A-запись "
            "(мост MSK идёт по IP, DNS может обновляться до суток)." if bad is not None else "")
     if how:
@@ -1167,8 +1430,11 @@ def role_of(db, eid):
     e = db["exits"][eid]
     if not e.get("enabled"):
         return "no", "выведен из работы"
+    down = not any(is_up(i) for i in plan.get("primary") or [])
     if eid in (plan.get("primary") or []):
-        return "on", "основной — трафик идёт сюда"
+        return ("off", "основной — недоступен, трафик идёт через резерв") if down else ("on", "основной — трафик идёт сюда")
+    if down and plan.get("fallback") == eid:
+        return "on", "резерв — трафик идёт сюда"
     order = [i for i, x in exits_sorted(db, True) if i not in (plan.get("primary") or [])]
     n = order.index(eid) + 1 if eid in order else "?"
     return ("warnp" if not is_up(eid) else "no"), f"резерв {n}" + (" (следующий)" if plan.get("fallback") == eid else "")
@@ -1196,6 +1462,10 @@ def render(msg=None, err=None, jid=None, readonly=False):
         addr = esc(e.get("host") or e.get("ip4") or "")
         if e.get("host") and e.get("ip4"):
             addr += f'<div class="mut">{esc(e["ip4"])}</div>'
+            bad = dns_mismatch(e)
+            if bad is not None:
+                addr += (f'<div class="mut" style="color:#e0a040" title="мост MSK идёт по IP, на работу не влияет; '
+                         f'DNS может обновляться до суток">DNS → {esc(", ".join(bad) or "не резолвится")}</div>')
         if e.get("ip6"):
             addr += f'<div class="mut">{esc(e["ip6"])}</div>'
         toggle = "Вывести из работы" if e.get("enabled") else "Вернуть в работу"
@@ -1213,10 +1483,11 @@ def render(msg=None, err=None, jid=None, readonly=False):
 <td><form method="post" action="/admin/servers/{eid}/update" style="display:inline"><input type="hidden" name="toggle" value="1">
 <button class="btn sm alt">{toggle}</button></form>
 <details style="display:inline-block"><summary class="btn sm alt" style="list-style:none">Адрес…</summary>
-<form method="post" action="/admin/servers/{eid}/address" style="margin-top:8px;min-width:220px">
+<form method="post" action="/admin/servers/{eid}/address" class="addr" style="margin-top:8px;min-width:220px">
 <input type="text" name="ip4" value="{esc(e.get('ip4') or '')}" placeholder="IPv4" style="margin-bottom:6px">
 <input type="text" name="ip6" value="{esc(e.get('ip6') or '')}" placeholder="IPv6 (можно подсеть /48)" style="margin-bottom:6px">
-<input type="text" name="host" value="{esc(e.get('host') or '')}" placeholder="домен (необязательно)" style="margin-bottom:6px">
+<input type="text" name="host" value="{esc(e.get('host') or '')}" placeholder="домен (необязательно)" list="dl-{eid}" style="margin-bottom:6px"><datalist id="dl-{eid}"></datalist>
+<div class="mut lk" style="margin-bottom:6px"></div>
 <button class="btn sm">Сохранить адрес</button>
 <div class="mut">Если хостер сменил IP сервера. Переустановка не нужна.</div></form></details>
 <details style="display:inline-block"><summary class="btn sm danger" style="list-style:none">Удалить…</summary>
@@ -1270,13 +1541,14 @@ def render(msg=None, err=None, jid=None, readonly=False):
     dns = dns_a(MSK_DOMAIN)
     dns_ok = s4 in dns
     add_card = f"""<div class="card"><h2>Добавить сервер</h2>
-<form method="post" action="/admin/servers/add">
+<form method="post" action="/admin/servers/add" class="addr">
 <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(200px,1fr))">
 <label>Название<input type="text" name="name" required maxlength="40" placeholder="Франкфурт"></label>
 <label>Код страны<input type="text" name="cc" maxlength="2" placeholder="DE"></label>
-<label>IPv4<input type="text" name="ip4" placeholder="1.2.3.4"></label>
-<label>IPv6 (желательно)<input type="text" name="ip6" placeholder="2a01:…::2"></label>
-<label>Домен (необязательно)<input type="text" name="host" placeholder="exit3.example.com"></label>
+<label>Домен<input type="text" name="host" placeholder="exit3.example.com" list="dl-add"><datalist id="dl-add"></datalist></label>
+<label>IPv4<input type="text" name="ip4" placeholder="из DNS или 1.2.3.4"></label>
+<label>IPv6 (желательно)<input type="text" name="ip6" placeholder="из DNS или 2a01:…::2"></label>
+<div class="mut lk" style="grid-column:1/-1;min-height:1.2em"></div>
 <label>Приоритет<input type="text" name="priority" value="{max([e['priority'] for e in db.get('exits', {}).values()] + [0]) + 1}"></label>
 <label>Сайт-маскировка Reality<select name="sni" style="font:inherit;color:#e8e8e8;background:#0e1015;border:1px solid #343a48;border-radius:8px;padding:9px 12px;width:100%">{sni_opts}</select></label>
 <label>Порт Reality<input type="text" name="port" value="443"></label>
@@ -1286,7 +1558,8 @@ def render(msg=None, err=None, jid=None, readonly=False):
 <button class="btn" style="margin-top:14px">Добавить и установить</button>
 <p class="note">Портал подключится к серверу по SSH, поставит Docker и ноду Remnawave, закроет порт управления для всех,
 кроме MSK, создаст ключи и включит сервер в цепочку. Пароль используется один раз и нигде не сохраняется.
-Требования: чистый Linux-сервер (Ubuntu/Debian) вне РФ, свободный порт Reality. Если IPv4 сервера окажется заблокирован
+Достаточно указать домен — IPv4/IPv6 подтянутся из DNS (и сверятся с самим сервером),
+или IP — портал подскажет домены, которые на него указывают. Требования: чистый Linux-сервер (Ubuntu/Debian) вне РФ, свободный порт Reality. Если IPv4 сервера окажется заблокирован
 в РФ, мост автоматически пойдёт по IPv6.</p></form></div>
 """
     msk_card = (f'<div class="kv"><span>Адрес MSK (разрешён в файрволах выходов)</span><span>{esc(s4)} · {esc(s6 or "—")}</span></div>'
@@ -1324,7 +1597,7 @@ def render(msg=None, err=None, jid=None, readonly=False):
 <div class="card"><h2>Критические ошибки</h2>{errors_html}</div></div></details>
 <div class="card"><h2>Вход MSK</h2>{msk_card}</div>
 </div>"""
-    return C.page(f"{C.BRAND} — серверы", body)
+    return C.page(f"{C.BRAND} — серверы", body, ADDR_JS)
 
 
 # ---------------------------------------------------------------- HTTP handlers (called from app.H)
@@ -1350,9 +1623,47 @@ def confirm_form(token, pend):
 </form>"""
 
 
+ADDR_JS = r"""
+document.querySelectorAll('form.addr').forEach(function (f) {
+  var h = f.elements.host, v4 = f.elements.ip4, v6 = f.elements.ip6, lk = f.querySelector('.lk'), dl = h.list;
+  function get(q, cb) { fetch('/admin/servers/lookup?' + q, {credentials: 'same-origin'}).then(function (r) { return r.json(); }).then(cb, function () {}); }
+  function note(t) { if (lk) lk.textContent = t; }
+  h.addEventListener('change', function () {
+    var d = h.value.trim(); if (!d) return;
+    note('DNS: смотрю ' + d + '…');
+    get('host=' + encodeURIComponent(d), function (r) {
+      if (r.error) return note(r.error);
+      if (!v4.value.trim() && r.v4.length) v4.value = r.v4[0];
+      if (!v6.value.trim() && r.v6.length) v6.value = r.v6[0];
+      var t = 'DNS ' + r.host + ': A ' + (r.v4.join(', ') || '—') + ', AAAA ' + (r.v6.join(', ') || '—');
+      var ip = v4.value.trim();
+      if (ip && r.v4.length && r.v4.indexOf(ip) < 0) t += ' — не совпадает с IPv4 ' + ip + ' (после смены IP DNS обновляется до суток; мост идёт по IP)';
+      note(t);
+    });
+  });
+  [v4, v6].forEach(function (inp) {
+    inp.addEventListener('change', function () {
+      var ip = inp.value.trim(); if (!ip || ip.indexOf('/') >= 0) return;
+      note('Ищу домены для ' + ip + '…');
+      get('ip=' + encodeURIComponent(ip), function (r) {
+        if (r.error) return note(r.error);
+        var all = r.match.concat(r.ptr ? [r.ptr] : []);
+        dl.innerHTML = ''; all.forEach(function (n) { var o = document.createElement('option'); o.value = n; dl.appendChild(o); });
+        if (!all.length) return note('Доменов на ' + ip + ' среди известных зон не найдено');
+        if (!h.value.trim() && r.match.length === 1) h.value = r.match[0];
+        note('На ' + ip + ' указывают: ' + (r.match.join(', ') || '—') + (r.ptr ? ' · PTR ' + r.ptr : '') + ' — выберите в поле «домен»');
+      });
+    });
+  });
+});
+"""
+
+
 def handle_get(h, path, q, readonly=False):
     if path in ("/admin/servers", "/admin/servers/"):
         return h.send(200, render(q.get("msg", [None])[0], q.get("err", [None])[0], q.get("job", [None])[0], readonly))
+    if path == "/admin/servers/lookup":
+        return h.send(200, json.dumps(lookup({k: v[0] for k, v in q.items()}), ensure_ascii=False), "application/json")
     return None
 
 

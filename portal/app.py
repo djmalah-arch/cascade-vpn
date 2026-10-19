@@ -46,6 +46,8 @@ LISTEN = ("127.0.0.1", 8090)
 DB_PATH = P("db.json", "/var/lib/geovpn-portal/db.json")
 AWG_DIR = os.environ.get("AWG_DIR", "/etc/amnezia/amneziawg")
 AWG_NET = "10.66.66"
+AWG_NET6 = "fd66:66:66::"   # ULA: clients' IPv6 goes into the tunnel too (without it, it bypasses the VPN)
+AWG_DNS = ("8.8.8.8", "77.88.8.8")   # any public resolver: xray on MSK answers port 53 itself (DoH + cache)
 APP_DIR = os.environ.get("APP_DIR", "/opt/geovpn-portal/app")
 SECRETS = P("secrets.env", "/root/geovpn-secrets.env")
 PORTAL_ENV = P("portal.env", "/etc/geovpn/portal.env")   # SERVERS_PASS/USERS_PASS (pbkdf2 salt$hash), SESSION_SECRET
@@ -61,6 +63,7 @@ class UserError(RuntimeError):
 
 
 MOD_GROUP = "work"          # the only group a moderator sees and creates users in
+ADMIN_GROUP = "main"        # group the admin's user list opens with
 DEFAULT_GROUP = "general"   # users created before groups existed
 
 
@@ -189,9 +192,14 @@ def log_error(text):
         db = load_db()
         errs = db.setdefault("errors", [])
         now = now_utc()
-        if errs and errs[0]["text"] == text and (now - parse_ts(errs[0]["last"])).total_seconds() < 1800:
-            errs[0]["count"] = errs[0].get("count", 1) + 1
-            errs[0]["last"] = now.isoformat()
+        # also when other errors came in between (two nodes failing in turn made dozens of separate lines)
+        same = next((i for i, x in enumerate(errs[:20]) if x["text"] == text
+                     and (now - parse_ts(x["last"])).total_seconds() < 1800), None)
+        if same is not None:
+            e = errs.pop(same)
+            e["count"] = e.get("count", 1) + 1
+            e["last"] = now.isoformat()
+            errs.insert(0, e)
         else:
             errs.insert(0, {"ts": now.isoformat(), "last": now.isoformat(), "text": text, "count": 1})
             del errs[100:]
@@ -266,14 +274,19 @@ def awg_new_peer(db):
     raise RuntimeError("Нет свободных адресов AmneziaWG")
 
 
+def awg_ip6(ip4):
+    return AWG_NET6 + ip4.rsplit(".", 1)[1]
+
+
 def awg_client_conf(peer):
     p = awg_params()
     spub, port = awg_server()
     # MTU 1376 (as AmneziaVPN itself uses): default 1420 breaks big packets on mobile networks with smaller MTU
-    lines = ["[Interface]", f"PrivateKey = {peer['priv']}", f"Address = {peer['ip']}/32", "DNS = 1.1.1.1, 1.0.0.1", "MTU = 1376"]
+    lines = ["[Interface]", f"PrivateKey = {peer['priv']}", f"Address = {peer['ip']}/32, {awg_ip6(peer['ip'])}/128",
+             "DNS = " + ", ".join(AWG_DNS), "MTU = 1376"]
     lines += [f"{k} = {v}" for k, v in p.items()]
     lines += ["", "[Peer]", f"PublicKey = {spub}", f"PresharedKey = {peer['psk']}", f"Endpoint = {HOST}:{port}",
-              "AllowedIPs = 0.0.0.0/0", "PersistentKeepalive = 25", ""]
+              "AllowedIPs = 0.0.0.0/0, ::/0", "PersistentKeepalive = 25", ""]
     return "\n".join(lines)
 
 
@@ -283,14 +296,14 @@ def awg_vpn_key(peer, title):
     spub, port = awg_server()
     conf = awg_client_conf(peer)
     last = dict(p)
-    last.update({"allowed_ips": ["0.0.0.0/0"], "clientId": "", "client_ip": peer["ip"], "client_priv_key": peer["priv"],
+    last.update({"allowed_ips": ["0.0.0.0/0", "::/0"], "clientId": "", "client_ip": peer["ip"], "client_priv_key": peer["priv"],
                  "client_pub_key": peer["pub"], "config": conf, "hostName": HOST, "mtu": "1376",
                  "persistent_keep_alive": "25", "port": int(port), "psk_key": peer["psk"], "server_pub_key": spub})
     awg = dict(p)
     awg.update({"last_config": json.dumps(last, ensure_ascii=False), "port": port, "protocol_version": "2",
                 "subnet_address": f"{AWG_NET}.0", "transport_proto": "udp"})
     data = {"containers": [{"awg": awg, "container": "amnezia-awg2"}], "defaultContainer": "amnezia-awg2",
-            "description": title, "dns1": "1.1.1.1", "dns2": "1.0.0.1", "hostName": HOST}
+            "description": title, "dns1": AWG_DNS[0], "dns2": AWG_DNS[1], "hostName": HOST}
     raw = json.dumps(data, ensure_ascii=False).encode()
     blob = len(raw).to_bytes(4, "big") + zlib.compress(raw, 8)
     return "vpn://" + base64.urlsafe_b64encode(blob).decode().rstrip("=")
@@ -302,11 +315,14 @@ def awg_apply(db):
     path = f"{AWG_DIR}/awg0.conf"
     conf = open(path, encoding="utf-8").read()
     head = conf.split("\n[Peer]")[0].rstrip() + "\n"
+    if AWG_NET6 not in head:        # installs before IPv6 in the tunnel: the server's IPv6 tunnel address
+        head = re.sub(r"(?m)^(Address\s*=\s*[^\n,]+)$", rf"\1, {AWG_NET6}1/64", head)
     peers = []
     for slug, u in sorted(db["users"].items()):
         if u.get("awg") and u["rw_id"] in active:
             a = u["awg"]
-            peers.append(f"\n[Peer]\n# {slug}\nPublicKey = {a['pub']}\nPresharedKey = {a['psk']}\nAllowedIPs = {a['ip']}/32\n")
+            peers.append(f"\n[Peer]\n# {slug}\nPublicKey = {a['pub']}\nPresharedKey = {a['psk']}\n"
+                         f"AllowedIPs = {a['ip']}/32, {awg_ip6(a['ip'])}/128\n")
     new = head + "".join(peers)
     if new != conf:
         with open(path + ".tmp", "w", encoding="utf-8") as f:
@@ -396,7 +412,7 @@ def create_user(name, group=MOD_GROUP):
             "username": slug, "description": name, "trafficLimitBytes": 0, "trafficLimitStrategy": "NO_RESET",
             "expireAt": (now_utc() + dt.timedelta(days=VALID_DAYS)).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
             "activeInternalSquads": [st["squads"]["clients"]]})
-        db["users"][slug] = {"name": name, "rw_id": u["id"], "page": f"{slug}-{secrets.token_hex(3)}",
+        db["users"][slug] = {"name": name, "rw_id": u["id"], "page": new_page_id(slug),
                              "created": now_utc().isoformat(), "awg": awg_new_peer(db), "mt": secrets.token_hex(16),
                              "group": group}
         save_db(db)
@@ -435,7 +451,7 @@ def user_action(slug, action, role="a", group=None):
             u["awg"] = None
             u["awg"] = awg_new_peer(db)
             u["mt"] = secrets.token_hex(16)
-            u["page"] = f"{slug}-{secrets.token_hex(3)}"
+            u["page"] = new_page_id(slug)
         elif action == "delete":
             try:
                 rw("DELETE", f"/api/users/{uid}")
@@ -469,7 +485,7 @@ def import_existing():
                 peer = {"ip": re.search(r"Address\s*=\s*([\d.]+)", t).group(1), "priv": priv, "pub": pub,
                         "psk": re.search(r"PresharedKey\s*=\s*(\S+)", t).group(1)}
             db["users"][slug] = {"name": ru.get("description") or slug, "rw_id": ru["id"],
-                                 "page": f"{slug}-{secrets.token_hex(3)}", "created": ru.get("createdAt"),
+                                 "page": new_page_id(slug), "created": ru.get("createdAt"),
                                  "awg": peer or awg_new_peer(db)}
             changed = True
         for u in db["users"].values():          # MTProxy secret for users created before it existed
@@ -519,6 +535,7 @@ def collect_monitoring():
         m["backup"] = dt.datetime.fromtimestamp(os.path.getmtime(os.path.join(BACKUP_DIR, b[-1])), dt.timezone.utc) if b else None
     except OSError:
         m["backup"] = None
+    m["offsite"] = load_db().get("backup_offsite")
     return m
 
 
@@ -570,25 +587,187 @@ def backup():
     os.chmod(out, 0o600)
     for f in sorted(x for x in os.listdir(BACKUP_DIR) if x.startswith("msk-"))[:-14]:
         os.remove(os.path.join(BACKUP_DIR, f))
-    target = SITE.get("BACKUP_SSH")            # optional offsite copy: user@host (key: <data>/ssh/backup_key)
-    key = os.path.join(DATA, "ssh", "backup_key")
-    if target and os.path.exists(key):
-        import paramiko
-        user, host = target.split("@", 1)
-        c = paramiko.SSHClient(); c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        c.connect(host, username=user, key_filename=key, timeout=20, allow_agent=False, look_for_keys=False)
-        sftp = c.open_sftp()
-        try:
-            sftp.mkdir("geovpn-backups")
-        except OSError:
-            pass
-        sftp.put(out, f"geovpn-backups/{os.path.basename(out)}")
-        sftp.close(); c.close()
+    return backup_offsite(out)
+
+
+def backup_offsite(path):
+    """Copy the backup to an exit: the lowest-priority one first (it carries the least traffic), then the others.
+    The exit stores it via a restricted key (servers.HOST_EXTRAS: geovpn-backup-recv, 30 copies)."""
+    import paramiko
+    name = os.path.basename(path)
+    db = load_db()
+    exits = sorted(db.get("exits", {}).values(), key=lambda e: (not e.get("enabled"), -e.get("priority", 0)))
+    if not exits:
+        return None
+    servers.backup_pubkey()
+    errs = []
+    for e in exits:
+        for host in [h for h in (e.get("ip4"), e.get("ip6")) if h]:
+            try:
+                c = paramiko.SSHClient()
+                c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                c.connect(host, username="root", key_filename=servers.BACKUP_KEY, timeout=15,
+                          allow_agent=False, look_for_keys=False)
+                ch = c.get_transport().open_session()
+                ch.settimeout(300)
+                ch.exec_command("put " + name)
+                with open(path, "rb") as f:
+                    for chunk in iter(lambda: f.read(65536), b""):
+                        ch.sendall(chunk)
+                ch.shutdown_write()
+                res = ch.makefile("rb").read().decode(errors="replace").strip()
+                c.close()
+                if res.startswith("ok"):
+                    with LOCK:
+                        fresh = load_db()
+                        fresh["backup_offsite"] = {"ts": now_utc().isoformat(), "server": e["name"]}
+                        save_db(fresh)
+                    return e["name"]
+                errs.append(f"{e['name']}: {res or 'нет ответа'}")
+                break                       # reachable, but refused: the other address won't help
+            except Exception as ex:
+                errs.append(f"{e['name']} ({host}): {ex}")
+    raise RuntimeError("копия бэкапа не отправлена ни на один выход (" + "; ".join(errs)[:300]
+                       + "). Ключ приёма ставится при добавлении сервера или: geovpn host-extras <id>")
+
+
+# ---------------------------------------------------------------- client-side routing audit
+# Happ/Hiddify must open RU sites straight from the device (the user's own IP): from the MSK DC IP Avito answers
+# "Доступ ограничен: проблема с IP" (2026-10-15), banks may refuse too. RU traffic of MSK_REALITY/MSK_HY2 users on MSK
+# (outbound direct-ru) = Hiddify without region Russia or Happ without its routing profile. Amnezia is full-tunnel by design.
+RU_AUDIT_AWK = r"""/\[MSK_(REALITY|HY2) -> / && / email: / { e = $NF; t[e]++
+  if (index($0, "-> direct-ru]")) { r[e]++; l[e] = $1 "T" $2 } }
+END { for (e in t) print e, t[e], r[e] + 0, l[e] }"""
+RU_MIN, RU_SHARE = 20, 0.1      # RU connections in the log window (~10 MB, half a day) to call it misconfigured
+RU_SHOW_DAYS = 3
+
+
+def client_label(ua):
+    m = re.match(r"(HiddifyNext|Happ)/([\d.]+)(?: \((\w+)\)|/(\w+))?", ua or "")
+    if not m:
+        return (ua or "")[:30]
+    return " ".join(x for x in ("Hiddify" if m[1] == "HiddifyNext" else "Happ", m[2], m[3] or m[4]) if x)
+
+
+def routing_audit():
+    rc, out = sh(["docker", "exec", "remnanode", "awk", RU_AUDIT_AWK, "/var/log/xray/current"], timeout=120)
+    if rc != 0:
+        raise RuntimeError(f"разбор лога xray: rc={rc}")
+    found = {}
+    for line in out.splitlines():
+        p = line.split()
+        if len(p) == 4 and int(p[2]) >= RU_MIN and int(p[2]) >= RU_SHARE * int(p[1]):
+            found[p[0]] = {"last": p[3].replace("/", "-") + "+00:00", "ru": int(p[2]), "total": int(p[1])}
+    clients = {}
+    for rec in rw("GET", "/api/subscription-request-history?start=0&size=200").get("records", []):
+        k = str(rec["userId"])
+        if rec["requestAt"] > clients.get(k, {}).get("ts", ""):
+            clients[k] = {"ts": rec["requestAt"], "app": client_label(rec.get("userAgent"))}
+    with LOCK:
+        db = load_db()
+        seen = db.setdefault("ru_via_msk", {})
+        seen.update(found)
+        old = (now_utc() - dt.timedelta(days=RU_SHOW_DAYS)).isoformat()
+        for k in [k for k, v in seen.items() if v["last"] < old]:
+            del seen[k]
+        db.setdefault("clients", {}).update(clients)
+        save_db(db)
+
+
+# ---------------------------------------------------------------- geoip/geosite for MSK routing (RU, YouTube, games...)
+# The node image carries the lists of its build date and is pinned, so they would never change. Weekly: fetch fresh
+# ones (same source as Xray's release), check them, copy into the node and restart xray; roll back if it breaks.
+GEO_URL = "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/"
+GEO_DIR = P("geo", "/var/lib/geovpn-portal/geo")
+GEO_IN_NODE = "/usr/local/share/xray"
+GEO_MUST = {"geosite.dat": (b"CATEGORY-RU", b"YOUTUBE", b"STEAM"), "geoip.dat": (b"PRIVATE",)}
+
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def geo_fetch(name):
+    """Download + verify against the published sha256; directly, or through the exits if GitHub is blocked."""
+    tmp = os.path.join(GEO_DIR, name + ".new")
+    for via in ([], ["--socks5-hostname", "127.0.0.1:10808"]):
+        rc, _ = sh(["curl", "-fsSL", "-m", "300", *via, "-o", tmp, GEO_URL + name], timeout=330)
+        rc2, sums = sh(["curl", "-fsSL", "-m", "60", *via, GEO_URL + name + ".sha256sum"])
+        if rc == 0 and rc2 == 0 and sums.split() and sha256_file(tmp) == sums.split()[0]:
+            data = open(tmp, "rb").read()
+            if len(data) > (1 << 20) and all(m in data for m in GEO_MUST[name]):
+                return tmp
+    raise RuntimeError(f"{name}: не скачан или не прошёл проверку")
+
+
+def node_geo_sha(name):
+    rc, out = sh(["docker", "exec", "remnanode", "sha256sum", f"{GEO_IN_NODE}/{name}"])
+    return out.split()[0] if rc == 0 and out else ""
+
+
+def geo_install(files):
+    """files: {name: local path}. Copy into the node, restart xray, check the channels; roll back on failure."""
+    prev = os.path.join(GEO_DIR, "prev")
+    os.makedirs(prev, exist_ok=True)
+    for name in files:
+        sh(["docker", "cp", f"remnanode:{GEO_IN_NODE}/{name}", os.path.join(prev, name)])
+
+    def put(src):
+        for name, path in src.items():
+            rc, out = sh(["docker", "cp", path, f"remnanode:{GEO_IN_NODE}/{name}"], timeout=120)
+            if rc != 0:
+                raise RuntimeError(f"docker cp {name}: {out[-200:]}")
+        st = json.load(open(STATE))
+        rw("POST", f"/api/nodes/{st['nodes']['MSK']}/actions/restart", {"forceRestart": True})
+        for _ in range(12):
+            time.sleep(5)
+            if probe(10808)[0] and sh(["curl", "-s", "-m", "10", "-o", "/dev/null", "-w", "%{http_code}", "--socks5-hostname",
+                                       "127.0.0.1:10803", "https://www.youtube.com/generate_204"])[1] == "204":
+                return True
+        return False
+
+    try:
+        if put(files):
+            return True
+    except Exception as e:
+        print("geo install failed:", repr(e), flush=True)
+    put({n: os.path.join(prev, n) for n in files})
+    raise RuntimeError("после обновления geoip/geosite xray не заработал — возвращены прежние файлы")
+
+
+def geo_update(force=False):
+    os.makedirs(GEO_DIR, exist_ok=True)
+    changed = {}
+    for name in GEO_MUST:
+        tmp = geo_fetch(name)
+        if sha256_file(tmp) != node_geo_sha(name):
+            changed[name] = tmp
+        else:
+            os.replace(tmp, os.path.join(GEO_DIR, name))
+    if not changed:
+        return "geoip/geosite: актуальны"
+    geo_install(changed)
+    for name, tmp in changed.items():
+        os.replace(tmp, os.path.join(GEO_DIR, name))
+    return "geoip/geosite обновлены: " + ", ".join(changed)
+
+
+def geo_restore():
+    """The node container was re-created (update/restart of the stack): it has the image's old lists again."""
+    files = {n: os.path.join(GEO_DIR, n) for n in GEO_MUST if os.path.exists(os.path.join(GEO_DIR, n))}
+    files = {n: p for n, p in files.items() if node_geo_sha(n) not in ("", sha256_file(p))}
+    if files:
+        geo_install(files)
+        print("geo lists restored in the node:", ", ".join(files), flush=True)
 
 
 def scheduler():
     """Docker mode only: heartbeat every minute, backup daily ~03:30 MSK, installers weekly."""
-    last = {"backup": None, "apps": 0}
+    last = {"backup": None, "apps": 0, "geo": None, "geo_check": 0, "audit": 0}
     while True:
         try:
             heartbeat()
@@ -601,6 +780,24 @@ def scheduler():
                 backup()
             except Exception as e:
                 log_error(f"Бэкап не сделан: {e}")
+        if msk.weekday() == 0 and msk.hour == 4 and last["geo"] != msk.date():      # Monday ~04:00 MSK
+            last["geo"] = msk.date()
+            try:
+                print(geo_update(), flush=True)
+            except Exception as e:
+                log_error(f"Обновление geoip/geosite: {e}")
+        elif time.time() - last["geo_check"] > 3600 and time.time() - STARTED > STARTUP_GRACE:
+            last["geo_check"] = time.time()
+            try:
+                geo_restore()
+            except Exception as e:
+                log_error(f"Возврат свежих geoip/geosite в ноду: {e}")
+        if time.time() - last["audit"] > 600 and time.time() - STARTED > STARTUP_GRACE:
+            last["audit"] = time.time()
+            try:
+                routing_audit()
+            except Exception as e:
+                print("routing audit:", repr(e), flush=True)     # diagnostics only: not worth an alarm
         if time.time() - last["apps"] > 7 * 86400:
             last["apps"] = time.time()
             rc, out = sh(["bash", "/app/scripts/apps-update.sh"], timeout=3600)
@@ -621,6 +818,14 @@ def ensure_awg_routing():
     if "local default" not in sh(["ip", "route", "show", "table", "100"])[1]:
         sh(["ip", "route", "replace", "local", "0.0.0.0/0", "dev", "lo", "table", "100"])
         log_error("Маршрут AmneziaWG в table 100 пропал — восстановлен автоматически")
+    if AWG_NET6 in open(f"{AWG_DIR}/awg0.conf", encoding="utf-8").read():     # IPv6 in the tunnel
+        if AWG_NET6 + "1/64" not in sh(["ip", "-6", "addr", "show", "dev", "awg0"])[1]:
+            sh(["ip", "-6", "addr", "add", AWG_NET6 + "1/64", "dev", "awg0"])
+        if "lookup 100" not in sh(["ip", "-6", "rule"])[1]:
+            sh(["ip", "-6", "rule", "add", "fwmark", "0x1", "lookup", "100"])
+            log_error("Правило маршрутизации AmneziaWG IPv6 пропало — восстановлено автоматически")
+        if "local default" not in sh(["ip", "-6", "route", "show", "table", "100"])[1]:
+            sh(["ip", "-6", "route", "replace", "local", "::/0", "dev", "lo", "table", "100"])
 
 
 def background():
@@ -769,12 +974,18 @@ def render_admin(msg=None, err=None, hl=None, role="u", gfilter=None):
             f'<div class="kv"><span>Аптайм</span><span>{esc(h["uptime"])}</span></div>'
             f'<div class="kv"><span>Последний бэкап</span><span>'
             f'{pill(bk and (now_utc() - bk).days < 2, ago(bk), ago(bk))}</span></div>')
+    off = m.get("offsite") or {}
+    ot = parse_ts(off.get("ts"))
+    host += (f'<div class="kv"><span>Копия на выходе</span><span>'
+             f'{pill(ot and (now_utc() - ot).days < 2, esc(off.get("server", "")) + ", " + ago(ot), "нет" if not ot else ago(ot))}</span></div>')
 
-    # users (moderator: only MOD_GROUP; admin: all or the selected group)
+    # users (moderator: only MOD_GROUP; admin: ADMIN_GROUP by default, ?g=all for everyone)
     is_admin = role == "a"
     groups = sorted({ugroup(x) for x in db["users"].values()} | {MOD_GROUP})
     if not is_admin:
         gfilter = MOD_GROUP
+    elif gfilter is None and ADMIN_GROUP in groups:
+        gfilter = ADMIN_GROUP
     elif gfilter not in groups:
         gfilter = None
     visible = {s: x for s, x in db["users"].items() if not gfilter or ugroup(x) == gfilter}
@@ -805,17 +1016,27 @@ def render_admin(msg=None, err=None, hl=None, role="u", gfilter=None):
         exp = parse_ts(r.get("expireAt"))
         exp_cls = "mut" if not exp or (exp - now_utc()).days > 14 else "warn"
         is_active = stt == "ACTIVE"
+        app_ = db.get("clients", {}).get(str(u["rw_id"]), {}).get("app")
+        rv = db.get("ru_via_msk", {}).get(str(u["rw_id"]))
+        ru_warn = (f' <span class="pill warnp" title="Российские сайты этого пользователя идут через сервер '
+                   f'({rv["ru"]} из {rv["total"]} соединений), а не напрямую с устройства: в Hiddify не выбран регион '
+                   f'«Россия», в Happ не включена маршрутизация GeoVPN. Avito и банки могут не открываться.">'
+                   f'RU через сервер · {ago(parse_ts(rv["last"]))}</span>') if rv else ""
         act = lambda a_, label, cls="alt", conf="": (
             f'<form method="post" action="/admin/u/{esc(slug)}/{a_}" style="display:inline"'
             f'{" onsubmit=" + chr(34) + "return confirm(" + esc(json.dumps(conf)) + ")" + chr(34) if conf else ""}>'
             f'<button class="btn sm {cls}">{label}</button></form>')
+        # sort keys for the client-side ordering (status: online first, disabled last)
+        st_rank = (0 if online else 1) if is_active else {"LIMITED": 2, "EXPIRED": 3, "DISABLED": 4}.get(stt, 5)
         rows += (
-            f'<tr class="{"hl" if slug == hl else ""}"><td><div class="nm">{esc(u["name"])}</div>'
+            f'<tr class="{"hl" if slug == hl else ""}" data-name="{esc(u["name"].lower())}" data-created="{esc(u.get("created") or "")}"'
+            f' data-exp="{exp.isoformat() if exp else "9999"}" data-st="{st_rank}"><td><div class="nm">{esc(u["name"])}</div>'
             f'<div class="mut">{esc(slug)}</div></td>'
             f'<td>{group_cell(slug, u)}</td>'
-            f'<td><span class="pill {spill[0]}">{spill[1]}</span>{" <span class=\"pill on\">online</span>" if online else ""}</td>'
+            f'<td><span class="pill {spill[0]}">{spill[1]}</span>{" <span class=\"pill on\">online</span>" if online else ""}{ru_warn}</td>'
             f'<td><span class="{exp_cls}">{fmt_date(exp)}</span></td>'
-            f'<td class="hide-sm">{gb(tr.get("lifetimeUsedTrafficBytes"))}<div class="mut">{ago(on_rw)}</div></td>'
+            f'<td class="hide-sm">{gb(tr.get("lifetimeUsedTrafficBytes"))}<div class="mut">{ago(on_rw)}</div>'
+            f'{f"<div class=mut>{esc(app_)}</div>" if app_ else ""}</td>'
             f'<td class="hide-sm">{gb((a.get("rx") or 0) + (a.get("tx") or 0))}<div class="mut">{ago(hs)}</div></td>'
             f'<td class="hide-sm">{gb(mt.get("octets"))}<div class="mut">{"подключён" if mt.get("curr") else "—"}</div></td>'
             f'<td><button class="btn sm" onclick="copyText({esc(json.dumps(invite_text(u), ensure_ascii=False))}, this)">Копировать</button>'
@@ -849,14 +1070,31 @@ def render_admin(msg=None, err=None, hl=None, role="u", gfilter=None):
                f'бэкап {ago(bk)}</span>')
     SEL = ('font:inherit;color:#e8e8e8;background:#0e1015;border:1px solid #343a48;border-radius:8px;'
            'padding:8px 10px;width:100%')
-    group_tabs = ""
+    group_sel = ""
     if is_admin:
-        group_tabs = ('<div class="row" style="margin-bottom:12px"><span class="mut">Группа:</span><div style="width:240px">'
-                      f'<select style="{SEL}" onchange="location.href=this.value">'
-                      + f'<option value="/admin"{"" if gfilter else " selected"}>все группы · {len(db["users"])}</option>'
-                      + "".join(f'<option value="/admin?g={quote(g)}"{" selected" if g == gfilter else ""}>{esc(g)} · {counts[g]}</option>'
-                                for g in groups)
-                      + '</select></div></div>')
+        group_sel = ('<span class="mut">Группа:</span><div style="width:240px">'
+                     f'<select style="{SEL}" onchange="location.href=this.value">'
+                     + f'<option value="/admin?g=all"{"" if gfilter else " selected"}>все группы · {len(db["users"])}</option>'
+                     + "".join(f'<option value="/admin?g={quote(g)}"{" selected" if g == gfilter else ""}>{esc(g)} · {counts[g]}</option>'
+                               for g in groups)
+                     + '</select></div>')
+    sorts = (("created", "сначала новые"), ("name", "по имени"), ("st", "по статусу"), ("exp", "по дате окончания"))
+    group_tabs = (f'<div class="row" style="margin-bottom:12px">{group_sel}<span class="mut">Сортировка:</span><div style="width:220px">'
+                  f'<select id="usort" style="{SEL}" onchange="sortUsers(this.value)">'
+                  + "".join(f'<option value="{k}">{t}</option>' for k, t in sorts) + '</select></div></div>'
+                  """<script>
+function sortUsers(k) {
+  try { localStorage.setItem("gvSort", k); } catch (e) {}
+  const by = (f) => (a, b) => f(a).localeCompare(f(b), "ru") || a.dataset.name.localeCompare(b.dataset.name, "ru");
+  const cmp = {created: (a, b) => b.dataset.created.localeCompare(a.dataset.created),
+               name: by(r => r.dataset.name), st: by(r => r.dataset.st), exp: by(r => r.dataset.exp)}[k];
+  if (!cmp) return;
+  const rows = [...document.querySelectorAll("#utab tr[data-name]")];
+  rows.sort(cmp).forEach(r => r.parentNode.appendChild(r));
+  document.getElementById("usort").value = k;
+}
+document.addEventListener("DOMContentLoaded", () => { let k; try { k = localStorage.getItem("gvSort"); } catch (e) {} if (k) sortUsers(k); });
+</script>""")
     body = f"""<div class="wrap">
 <h1>{BRAND} — управление</h1>
 <div class="sub">Пользователей{"" if is_admin and not gfilter else " в группе " + esc(gfilter)}: {len(visible)} · сейчас online: {total_online} · обновлено {m["ts"].astimezone(dt.timezone(dt.timedelta(hours=3))).strftime("%H:%M:%S")} МСК ·
@@ -881,11 +1119,12 @@ def render_admin(msg=None, err=None, hl=None, role="u", gfilter=None):
 <div class="card"><h2>Службы MSK</h2>{svc}</div>
 <div class="card"><h2>Сервер MSK</h2>{host}</div>
 </div></details>
-<div class="card"><h2>Пользователи</h2>{group_tabs}<div class="scroll"><table>
+<div class="card"><h2>Пользователи</h2>{group_tabs}<div class="scroll"><table id="utab">
 <tr><th>Пользователь</th><th>Группа</th><th>Статус</th><th>До</th><th class="hide-sm">Happ/Hiddify<br><span class="mut">трафик · активность</span></th>
 <th class="hide-sm">Amnezia<br><span class="mut">трафик* · активность</span></th><th class="hide-sm">Telegram<br><span class="mut">трафик* · сейчас</span></th><th>Действия</th></tr>
 {rows or '<tr><td colspan="8" class="mut">Пока никого нет</td></tr>'}
-</table></div><p class="note">* трафик Amnezia и Telegram считается с последнего перезапуска службы. «+1 год» продлевает от текущей даты окончания.</p></div>
+</table></div><p class="note">* трафик Amnezia и Telegram считается с последнего перезапуска службы. «+1 год» продлевает от текущей даты окончания.
+«RU через сервер» — у пользователя российские сайты идут через сервер, а не напрямую: в Hiddify не выбран регион «Россия» (шаг 3 на его странице), в Happ не включена маршрутизация GeoVPN. Проверка раз в 10 минут, метка держится 3 дня.</p></div>
 </div>"""
     return page(f"{BRAND} — управление", body)
 
@@ -1020,8 +1259,10 @@ def render_user(u, client_ip):
     tg_link, _ = mt_links(u)
     android_note = '<p class="note">На Android при установке файла появится предупреждение о неизвестном источнике — это нормально, приложение скачивается с нашего сервера, а не из Google Play.</p>'
 
-    happ = option("happ", "H", "#3866ff", "Happ", '<span class="badge">Альтернатива</span>',
-        "Такой же VPN, но другое приложение. Выберите, если Hiddify не устанавливается или работает нестабильно. Российские сайты открываются напрямую, остальное — через VPN.",
+    # Happ first: it takes the routing profile from the subscription (RU sites straight from the device, updated by us);
+    # Hiddify accepts no rules from a subscription - the user has to set the region by hand (cli.happ_routing)
+    happ = option("happ", "H", "#3866ff", "Happ", '<span class="badge rec">Рекомендуем</span>',
+        "Основной вариант. Российские сайты (банки, Госуслуги, Avito) открываются напрямую, остальное — через VPN. Ничего настраивать не нужно: правила приходят с сервера и обновляются сами.",
         "Windows · Android · Mac · iPhone и iPad",
         step(1, "Установите приложение",
              f'<div class="dls">{dl("Happ-windows.exe", "Windows", "windows")}{dl("Happ-android.apk", "Android", "android")}'
@@ -1031,13 +1272,14 @@ def render_user(u, client_ip):
              connect_block(sub, "m", "happ-uri", sub, f'<a class="btn" href="happ://add/{esc(sub)}">Открыть в Happ</a>',
                            "Кнопка сама добавит подключение в Happ. Или отсканируйте QR-код в приложении (кнопка «+» → QR), или скопируйте ссылку и добавьте её из буфера обмена:"))
         + step(3, "Подключитесь",
-             '<ol><li>В списке выберите сервер <b>RU MSK Reality</b> и нажмите большую кнопку подключения.</li>'
-             '<li>Если соединение нестабильно — выберите <b>RU MSK Hysteria2</b>.</li>'
+             '<ol><li>Если Happ спросит про профиль маршрутизации <b>GeoVPN</b> — согласитесь: с ним российские сайты работают напрямую.</li>'
+             '<li>В списке выберите <b>GeoVPN авто</b> и нажмите большую кнопку подключения. Happ сам выбирает лучший способ подключения '
+             'и переключается, если один не работает в этой сети (например, на Wi-Fi, где его режут).</li>'
              '<li>Для игр на Windows включите режим «Системный прокси» — игры пойдут мимо VPN. На Android игры можно исключить в «Раздельном туннелировании».</li></ol>'
              '<p class="note">Настройки обновляются сами: если на сервере что-то изменится, приложение получит это автоматически.</p>'))
 
-    hiddify = option("hiddify", "Hi", "#6d4aff", "Hiddify", '<span class="badge rec">Рекомендуем</span>',
-        "Основной вариант. Сам выбирает самый быстрый способ подключения; российские сайты при этом открываются напрямую, остальное — через VPN.",
+    hiddify = option("hiddify", "Hi", "#6d4aff", "Hiddify", '<span class="badge">Альтернатива</span>',
+        "Если Happ не подходит. Сам выбирает самый быстрый способ подключения. Нужно один раз настроить регион и DNS (шаг 3), иначе российские сайты пойдут через VPN и некоторые (Avito, банки) не откроются.",
         "Windows · Android · Mac · iPhone и iPad",
         step(1, "Установите приложение",
              f'<div class="dls">{dl("Hiddify-windows.exe", "Windows", "windows")}{dl("Hiddify-android.apk", "Android", "android")}'
@@ -1048,9 +1290,15 @@ def render_user(u, client_ip):
         + step(2, "Добавьте подключение",
              connect_block(sub_named, "m", "hid-uri", sub_named, f'<a class="btn" href="hiddify://import/{esc(sub_named)}">Открыть в Hiddify</a>',
                            "Кнопка сама добавит подключение в Hiddify. Или в приложении нажмите «Добавить профиль» и отсканируйте QR-код / вставьте ссылку:"))
-        + step(3, "Подключитесь",
-             '<ol><li>При первом запуске выберите регион <b>Russia</b> — российские сайты будут работать напрямую.</li>'
-             '<li>Нажмите большую кнопку подключения. Если соединение нестабильно — выберите в списке <b>RU MSK Hysteria2</b>.</li></ol>'))
+        # labels as in Hiddify 4.1.1 (assets/translations/ru.i18n.json); DoH by IP: works where port 53 is blocked
+        + step(3, "Настройте один раз и подключитесь",
+             '<ol><li><b>Настройки → Маршрутизация → Регион</b>: выберите <b>Россия (ru)</b>. '
+             '<b>Обязательно</b> — без этого банки, Госуслуги и Avito пойдут через VPN и могут не открыться.</li>'
+             '<li>Там же <b>Маршрут IPv6</b>: <b>Включить</b> — иначе на некоторых Wi-Fi часть приложений (например, Instagram) пойдёт мимо VPN и не будет работать.</li>'
+             '<li><b>Настройки → DNS → Распознаватель исходящего сервера (напрямую)</b>: впишите '
+             '<code style="display:inline;padding:1px 6px">https://77.88.8.8/dns-query</code> — так интернет будет работать и в сетях, где закрыт обычный DNS (гостиницы, офисы).</li>'
+             '<li>Нажмите большую кнопку подключения — Hiddify сам выберет работающий сервер.</li></ol>'
+             '<p class="note">Если Wi-Fi просит войти через страницу (гостиница, кафе, метро) — отключите VPN, войдите, затем включите снова.</p>'))
 
     amnezia = option("amnezia", "A", "#0f9d74", "Amnezia", '<span class="badge">Другой протокол</span>',
         "Принципиально другой протокол (AmneziaWG), не связанный с Hiddify и Happ. Может работать, когда они не подключаются — например, если их блокирует провайдер, мобильная сеть или сеть на работе.",
@@ -1067,7 +1315,9 @@ def render_user(u, client_ip):
                            "Откройте скачанный файл в Amnezia. Или в приложении нажмите «+» и отсканируйте QR-код / вставьте ссылку:"))
         + step(3, "Подключитесь",
              '<ol><li>Нажмите «Подключиться».</li>'
-             '<li>Игры и отдельные приложения можно пустить мимо VPN в разделе «Раздельное туннелирование».</li></ol>'))
+             '<li>Игры и отдельные приложения можно пустить мимо VPN в разделе «Раздельное туннелирование».</li></ol>'
+             '<p class="note">В Amnezia через VPN идёт всё, в том числе российские сайты — а Avito и некоторые банки не пускают с адреса сервера. '
+             'Для них отключайте VPN или добавьте их в «Раздельное туннелирование». Если такое мешает — выберите Happ.</p>'))
 
     telegram = option("telegram", "✈", "#229ed9", "Только Telegram", '<span class="badge tg">Не VPN</span>',
         "Прокси, чтобы Telegram работал без включённого VPN. Другие сайты и приложения он не открывает. Если у вас уже работает VPN — это не нужно.",
@@ -1084,8 +1334,8 @@ def render_user(u, client_ip):
 
     body = head + f"""<div class="card intro">Здесь всё для подключения к VPN: заблокированные сайты и сервисы откроются,
 а российские продолжат работать напрямую.<br><b>Достаточно одного приложения.</b> Выберите вариант ниже —
-откроется пошаговая инструкция. Не знаете, что выбрать, — берите <b>Hiddify</b>.</div>
-<div class="opts">{hiddify}{happ}{amnezia}{telegram}</div>
+откроется пошаговая инструкция. Не знаете, что выбрать, — берите <b>Happ</b>.</div>
+<div class="opts">{happ}{hiddify}{amnezia}{telegram}</div>
 <div class="card"><div class="hint" style="margin:0">Доступ действует до <b>{fmt_date(r.get("expireAt"))}</b>.</div>
 <div class="warn" style="margin-top:10px"><b>Страница является персональной.</b>
 Подключиться по ней может любой, кто получит ссылку — пароль не запрашивается.<br>
@@ -1093,6 +1343,26 @@ def render_user(u, client_ip):
 подключения из-за большого числа одновременных сессий, так и к блокировке сервиса целиком.</div></div>
 <div class="foot">{esc(client_ip)}</div></div>"""
     return page(f"{BRAND} — подключение", f"<style>{USER_CSS}</style>" + body, USER_JS)
+
+
+def new_page_id(slug):
+    # the personal page holds every key of the user: 128 random bits (it used to be 24 bits after a guessable name)
+    return f"{slug}-{secrets.token_hex(16)}"
+
+
+PAGE_MISSES = {}     # client ip -> [timestamps of unknown /sub/... ids]: throttles guessing of page addresses
+
+
+def page_throttled(ip, miss=False):
+    now = time.time()
+    with LOCK:
+        t = [x for x in PAGE_MISSES.get(ip, []) if now - x < 600]
+        if miss:
+            t.append(now)
+        PAGE_MISSES[ip] = t
+        if len(PAGE_MISSES) > 10000:
+            PAGE_MISSES.clear()
+        return len(t) > 20
 
 
 def find_by_page(pid):
@@ -1200,8 +1470,12 @@ class H(BaseHTTPRequestHandler):
         try:
             m = re.fullmatch(r"/(?:sub|c)/([a-z0-9-]+)(/conf)?/?", p)
             if m:
+                ip = self.client_ip()
+                if page_throttled(ip):
+                    return self.send(429, "Too many requests, try again in 10 minutes", "text/plain")
                 slug, u = find_by_page(m.group(1))
                 if not u:
+                    page_throttled(ip, miss=True)
                     return self.not_found()
                 if m.group(2):
                     r = rw_user_by_id(u["rw_id"])

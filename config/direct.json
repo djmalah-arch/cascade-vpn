@@ -3,7 +3,8 @@
  "domains": [
   "steampowered.com", "steamcommunity.com", "steamcontent.com", "steamserver.net", "steamstatic.com",
   "steamusercontent.com", "steam-chat.com", "steamgames.com", "valvesoftware.com", "counter-strike.net",
-  "stalcraft.net", "stalzone.com", "stalzone.net", "exbo.net"
+  "stalcraft.net", "stalzone.com", "stalzone.net", "exbo.net",
+  "gaijin.net", "warthunder.com", "warthunder.ru", "gaijinent.com"
  ],
  "geosite": ["steam"],
  "ips": [
@@ -13,7 +14,9 @@
   "2404:3fc0::/44", "2602:801:f000::/44", "2a01:bc80::/44",
   "138.249.102.0/23"
  ],
+ "udp_ports": ["19000-20999"],
  "_sources": {
+  "warthunder": "War Thunder game servers are rented anywhere (LeaseWeb, OVH, G-Core, Cloudflare relays): matched by their UDP ports 19xxx-20xxx seen on 2026-09-29. Via the exits EU servers didn't answer (the game fell back to Tokyo, 300 ms)",
   "valve": "RIPEstat announced prefixes AS32590 (Valve), 2026-09-27; CS2/Steam game servers and SDR relays",
   "exbo": "AS219021 Eksbo Sever LLC (STALZONE/STALCRAFT game servers, RU) + game/launcher domains"
  }

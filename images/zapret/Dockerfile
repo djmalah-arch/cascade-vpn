@@ -1,5 +1,5 @@
 # zapret (nfqws): DPI bypass for YouTube over IPv4 on the entry server. Host networking + NET_ADMIN.
-FROM debian:trixie-slim
+FROM debian:trixie-slim@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a
 ARG ZAPRET_VERSION=v72.13
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl nftables procps bash dnsutils \
  && rm -rf /var/lib/apt/lists/* \
