@@ -4,6 +4,7 @@
   docker exec geovpn-portal geovpn apply-direct          # apply direct.json (games etc. bypass the VPN) everywhere
   docker exec geovpn-portal geovpn happ-routing          # re-send the Happ routing profile in the subscription
   docker exec geovpn-portal geovpn happ-auto             # Happ JSON config 'GeoVPN авто' (Hysteria2/Reality auto-switch)
+  docker exec geovpn-portal geovpn pin servfort geosite:openai   # these domains only via this exit (no domains = unpin)
   docker exec geovpn-portal geovpn set-password admin|users 'NEW'
   docker exec geovpn-portal geovpn backup                # make a backup now (+ copy to the lowest-priority exit)
   docker exec -it geovpn-portal geovpn host-extras <id>  # exit: fail2ban, MTU probing, backup receiver (asks root password)
@@ -171,6 +172,22 @@ def apply_direct():
     print("MSK profile: will be re-applied by the portal within ~30 s (xray restart, 1-2 s blip)")
 
 
+def pin(eid, doms):
+    """Route these domains via one exit (db.pins); no domains = remove the pin. Re-applied by the watchdog."""
+    with app.LOCK:
+        db = app.load_db()
+        if doms and eid not in db.get("exits", {}):
+            sys.exit("unknown exit id; ids: " + ", ".join(db.get("exits", {})))
+        pins = db.setdefault("pins", {})
+        if doms:
+            pins[eid] = doms
+        else:
+            pins.pop(eid, None)
+        db.setdefault("balancer", {})["plan"] = None
+        app.save_db(db)
+    print("pins:", db["pins"] or "none", "- MSK profile re-applied within ~30 s (xray restart, 1-2 s blip)")
+
+
 def set_password(which, pw):
     key, plain = {"admin": ("SERVERS_PASS", "SERVERS_PAGE_PASS"), "users": ("USERS_PASS", "USERS_PAGE_PASS")}[which]
     if len(pw) < 6:
@@ -197,6 +214,8 @@ def main():
         templates()
     elif a[0] == "happ-auto":
         happ_auto()
+    elif a[0] == "pin" and len(a) >= 2:
+        pin(a[1], a[2:])
     elif a[0] == "set-password" and len(a) == 3 and a[1] in ("admin", "users"):
         set_password(a[1], a[2])
     elif a[0] == "ensure-node":        # the panel disables a node after repeated failed connects (e.g. during install)
