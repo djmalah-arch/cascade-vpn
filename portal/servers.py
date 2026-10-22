@@ -431,9 +431,9 @@ def msk_profile(db, plan):
         rules.append({"inboundTag": [f"MON_{eid}_6"], "outboundTag": f"x-{eid}-6" if f"x-{eid}-6" in tags else "block"})
     outs.append({"tag": "block", "protocol": "blackhole"})
     primary = plan["primary"] or []
+    fam = plan.get("fam") or {}
     have_exits = any(out_tags(i, e) for i, e in exits_sorted(db, True))
     if have_exits:
-        fam = plan.get("fam") or {}
         main = {"tag": "exits", "selector": [f"x-{i}-{fam.get(i, '')}" for i in primary] or ["x-"],
                 "strategy": {"type": "leastPing"}}
         if plan.get("fallback"):
@@ -444,6 +444,16 @@ def msk_profile(db, plan):
               {"protocol": ["bittorrent"], "outboundTag": "block"},
               {"network": "udp", "port": "443", "domain": ["geosite:youtube"], "outboundTag": "block"},
               {"domain": ["geosite:youtube"], "outboundTag": "yt-dpi"}]
+    # db["pins"] = {exit_id: [domains]}: services that need a particular exit (e.g. geosite:openai -> the exit whose
+    # IP every geo database places in a supported country). Exit down -> its probes fail -> fallback to the primary.
+    for eid, doms in (db.get("pins") or {}).items():
+        e = db.get("exits", {}).get(eid)
+        if not (doms and e and out_tags(eid, e) and primary):
+            continue
+        bals.append({"tag": f"pin-{eid}", "selector": [f"x-{eid}-"], "strategy": {"type": "leastPing"},
+                     "fallbackTag": f"x-{primary[0]}-{fam[primary[0]]}" if fam.get(primary[0])
+                     else best_tag(primary[0], db["exits"][primary[0]])})
+        rules.append({"domain": doms, "balancerTag": f"pin-{eid}"})
     # games/services from direct.json: straight from MSK, no detour via exits (Hiddify/Amnezia users)
     try:
         dj = json.load(open(C.DIRECT_JSON))
