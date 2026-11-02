@@ -4,10 +4,14 @@ The portal owns the MSK xray profile: it is generated from db["exits"] (priority
 A watchdog probes every exit (via per-exit local inbounds on MSK) and rebuilds the chain
 primary -> reserve 1 -> reserve 2 ... when availability changes.
 """
-import datetime as dt, json, os, re, secrets, socket, threading, time, traceback
+import datetime as dt, json, os, re, secrets, socket, threading, time, traceback, subprocess
 from concurrent.futures import ThreadPoolExecutor
 
 import app as C
+from storage import ProcessLock
+import ssh_trust
+import routing_policy
+from backups import BACKUP_NAME_RE
 
 MSK_DOMAIN = C.HOST
 CERT = f"/var/lib/remnawave/configs/xray/ssl/{MSK_DOMAIN}"   # Caddy's Let's Encrypt cert, mounted into the node
@@ -33,6 +37,7 @@ STATUS = {}          # id -> {"ok","ms","ip","v4","v6","ts"}
 COUNTERS = {}        # id -> {"fail": n, "ok": n, "up": bool}
 JOBS = {}            # job id -> {"title","log":[],"done","ok","started"}
 APPLY_LOCK = threading.Lock()
+JOB_LOCK = ProcessLock(lambda: C.DB_PATH + ".jobs.lock")
 
 
 # ---------------------------------------------------------------- state / seed
@@ -138,13 +143,18 @@ cat > /usr/local/sbin/geovpn-backup-recv <<'X'
 #!/bin/bash
 # Forced command of the GeoVPN portal backup key (authorized_keys): only stores an MSK backup sent on stdin.
 d=/root/geovpn-backups
-n=${SSH_ORIGINAL_COMMAND#put }
-[[ $SSH_ORIGINAL_COMMAND == "put "* && $n =~ ^msk-[0-9]{8}-[0-9]{4}\.tar\.gz$ ]] || { echo denied; exit 1; }
+read -r command n expected extra <<< "$SSH_ORIGINAL_COMMAND"
+[[ $command == put && $n =~ __BACKUP_PATTERN__ && -z $extra ]] || { echo denied; exit 1; }
+[[ -z $expected || $expected =~ ^[0-9a-f]{64}$ ]] || { echo denied; exit 1; }
 mkdir -p -m 700 $d
-if head -c 512M > "$d/.$n.part" && [ -s "$d/.$n.part" ]; then mv "$d/.$n.part" "$d/$n"; chmod 600 "$d/$n"
-else rm -f "$d/.$n.part"; echo failed; exit 1; fi
+exec 9>"$d/.receive.lock"; flock 9
+part="$d/.$n.part"
+if ! head -c 536870913 > "$part" || [ ! -s "$part" ] || [ "$(stat -c %s "$part")" -gt 536870912 ]; then rm -f "$part"; echo failed; exit 1; fi
+actual=$(sha256sum "$part" | cut -d' ' -f1)
+if [ -n "$expected" ] && [ "$actual" != "$expected" ]; then rm -f "$part"; echo checksum-failed; exit 1; fi
+mv "$part" "$d/$n"; chmod 600 "$d/$n"
 ls -1t $d/msk-*.tar.gz | tail -n +31 | xargs -r rm -f
-echo "ok $(du -h "$d/$n" | cut -f1)"
+echo "ok $actual"
 X
 chmod 755 /usr/local/sbin/geovpn-backup-recv
 mkdir -p /root/.ssh && touch /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys
@@ -158,7 +168,7 @@ def host_extras(c, db, log=print):
     """Run HOST_EXTRAS on an exit (open paramiko session as root). Failures here don't break the exit itself."""
     v4, v6 = msk_addrs(db)
     key = backup_pubkey()
-    script = (HOST_EXTRAS.replace("__MSK4__", v4 or "").replace("__MSK6__", v6 or "")
+    script = (HOST_EXTRAS.replace("__BACKUP_PATTERN__", BACKUP_NAME_RE).replace("__MSK4__", v4 or "").replace("__MSK6__", v6 or "")
               .replace("__BKEY__", key.split()[1]).replace("__BKEYLINE__", key))
     return ssh_run(c, script, log, timeout=600)
 
@@ -171,9 +181,8 @@ def push_msk_addrs(db, v4, v6, log=print):
         ok = False
         for host in [h for h in (e.get("ip6"), e.get("ip4")) if h]:
             try:
-                c = paramiko.SSHClient()
-                c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-                c.connect(host, username="root", key_filename=PORTAL_KEY, timeout=10, allow_agent=False, look_for_keys=False)
+                c = ssh_trust.connect(host, e.get("ssh_port", 22), C.P("ssh/known_hosts", "/root/.ssh/geovpn_known_hosts"),
+                                      key_filename=PORTAL_KEY, expected=e.get("ssh_fingerprint"), timeout=10)
                 _, o, _ = c.exec_command(f"set-msk {v4} {v6 or '-'}", timeout=30)
                 out = o.read().decode().strip()
                 c.close()
@@ -198,7 +207,7 @@ def check_msk_ip(db):
     db["msk"] = {"v4": d4, "v6": d6 or s6}
     bad = [db["exits"][i]["name"] for i, ok in res.items() if not ok]
     event(db, f"Сменился IP MSK: {s4} → {d4}. Файрволы выходов обновлены"
-              + (f", кроме: {', '.join(bad)}" if bad else "") + ". Смените A-запись geo-msk в DNS!")
+              + (f", кроме: {', '.join(bad)}" if bad else "") + f". Смените A-запись {MSK_DOMAIN} в DNS!")
     return True
 
 
@@ -307,6 +316,15 @@ def event(db, text):
     db.setdefault("balancer", {"plan": None, "events": []})
     db["balancer"]["events"].insert(0, {"ts": C.now_utc().isoformat(), "text": text})
     del db["balancer"]["events"][50:]
+
+
+def save_balancer(db):
+    """A slow probe must not undo a newer topology change or CLI invalidation."""
+    with C.LOCK:
+        fresh = C.load_db()
+        if fresh.get("_routing_revision", 0) != db.get("_routing_revision", 0): return
+        fresh["balancer"] = db["balancer"]
+        C.save_db(fresh)
 
 
 # ---------------------------------------------------------------- xray config generation
@@ -434,21 +452,26 @@ def msk_profile(db, plan):
     fam = plan.get("fam") or {}
     have_exits = any(out_tags(i, e) for i, e in exits_sorted(db, True))
     if have_exits:
-        main = {"tag": "exits", "selector": [f"x-{i}-{fam.get(i, '')}" for i in primary] or ["x-"],
+        selectors = [f"x-{i}-{fam.get(i, '')}" for i in primary if db["exits"].get(i, {}).get("enabled")]
+        main = {"tag": "exits", "selector": selectors or [f"x-{i}-" for i, e in exits_sorted(db, True)],
                 "strategy": {"type": "leastPing"}}
         if plan.get("fallback"):
             main["fallbackTag"] = best_tag(plan["fallback"], db["exits"][plan["fallback"]])
         bals.insert(0, main)
-    to_exits = {"balancerTag": "exits"} if have_exits else {"outboundTag": "direct"}   # fresh install: no exits yet
-    rules += [dict({"inboundTag": ["MTP_OUT"]}, **to_exits),
-              {"protocol": ["bittorrent"], "outboundTag": "block"},
+    # Keep private addresses inaccessible even when a later domain/port rule allows direct traffic.
+    to_exits = {"balancerTag": "exits"} if have_exits else {"outboundTag": "block"}
+    rules += [{"ip": ["geoip:private"], "outboundTag": "block"},
+              dict({"inboundTag": ["MTP_OUT"]}, **to_exits),
+              {"protocol": ["bittorrent"], "outboundTag": "block"}]
+    rules += routing_policy.rules(db, to_exits)
+    rules += [
               {"network": "udp", "port": "443", "domain": ["geosite:youtube"], "outboundTag": "block"},
               {"domain": ["geosite:youtube"], "outboundTag": "yt-dpi"}]
     # db["pins"] = {exit_id: [domains]}: services that need a particular exit (e.g. geosite:openai -> the exit whose
     # IP every geo database places in a supported country). Exit down -> its probes fail -> fallback to the primary.
     for eid, doms in (db.get("pins") or {}).items():
         e = db.get("exits", {}).get(eid)
-        if not (doms and e and out_tags(eid, e) and primary):
+        if not (doms and e and e.get("enabled") and out_tags(eid, e) and primary):
             continue
         bals.append({"tag": f"pin-{eid}", "selector": [f"x-{eid}-"], "strategy": {"type": "leastPing"},
                      "fallbackTag": f"x-{primary[0]}-{fam[primary[0]]}" if fam.get(primary[0])
@@ -456,16 +479,15 @@ def msk_profile(db, plan):
         rules.append({"domain": doms, "balancerTag": f"pin-{eid}"})
     # games/services from direct.json: straight from MSK, no detour via exits (Hiddify/Amnezia users)
     try:
-        dj = json.load(open(C.DIRECT_JSON))
-        rules += [{"domain": ["geosite:" + g for g in dj.get("geosite", [])] + ["domain:" + x for x in dj["domains"]],
-                   "outboundTag": "direct"},
-                  {"ip": dj["ips"], "outboundTag": "direct"}]
+        dj = routing_policy.direct_config(db, C.read_json(C.DIRECT_JSON))
+        domains = ["geosite:" + g for g in dj.get("geosite", [])] + ["domain:" + x for x in dj["domains"]]
+        if domains: rules.append({"domain": domains, "outboundTag": "direct"})
+        if dj["ips"]: rules.append({"ip": dj["ips"], "outboundTag": "direct"})
         if dj.get("udp_ports"):       # game servers known only by port (hosted anywhere, e.g. War Thunder)
             rules.append({"network": "udp", "port": ",".join(dj["udp_ports"]), "outboundTag": "direct"})
     except (OSError, ValueError, KeyError) as e:
         print("direct.json not applied:", e, flush=True)
     rules += [
-              {"ip": ["geoip:private"], "outboundTag": "block"},
               {"domain": ["geosite:category-ru"], "outboundTag": "direct-ru"},
               {"ip": ["geoip:ru"], "outboundTag": "direct-ru"},
               dict({"network": "tcp,udp"}, **to_exits)]
@@ -476,12 +498,30 @@ def msk_profile(db, plan):
             "routing": {"domainStrategy": "IPIfNonMatch", "balancers": bals, "rules": rules}}
 
 
+def validate_profile(config):
+    result = subprocess.run(["docker", "exec", "-i", "remnanode", "/usr/local/bin/xray", "run", "-test", "-config", "stdin:"],
+                            input=json.dumps(config), text=True, capture_output=True, timeout=45)
+    if result.returncode:
+        raise C.UserError("Профиль не прошёл проверку Xray. Проверьте категории и адреса; рабочий профиль не изменён.")
+
+
 def apply(db, plan=None):
     """Push MSK profile (+ node inbounds) and bridge squad to Remnawave."""
-    with APPLY_LOCK:
+    # Same lock order everywhere. Never apply a snapshot read before a slow network probe.
+    with C.LOCK, APPLY_LOCK:
+        fresh = C.load_db()
+        if (fresh.get("_routing_revision", 0) != db.get("_routing_revision", 0)
+                or any(fresh.get(k) != db.get(k) for k in ("exits", "pins", "msk"))):
+            for k in ("exits", "pins", "msk", "balancer"):
+                if k in fresh: db[k] = fresh[k]
+                else: db.pop(k, None)
+            plan = compute_plan(db)
+            db["_routing_revision"] = fresh.get("_routing_revision", 0)
         st = state()
         plan = plan or db["balancer"].get("plan") or compute_plan(db)
-        prof = C.rw("PATCH", "/api/config-profiles", {"uuid": st["profiles"]["MSK"]["uuid"], "config": msk_profile(db, plan)})
+        config = msk_profile(db, plan)
+        validate_profile(config)
+        prof = C.rw("PATCH", "/api/config-profiles", {"uuid": st["profiles"]["MSK"]["uuid"], "config": config})
         C.rw("PATCH", "/api/nodes", {"uuid": st["nodes"]["MSK"], "configProfile": {
             "activeConfigProfileUuid": st["profiles"]["MSK"]["uuid"], "activeInbounds": [i["uuid"] for i in prof["inbounds"]]}})
         inbounds = []
@@ -491,6 +531,9 @@ def apply(db, plan=None):
                 inbounds += [i["uuid"] for i in p.get("inbounds", [])]
         C.rw("PATCH", "/api/internal-squads", {"uuid": st["squads"]["bridge"], "inbounds": inbounds})
         db["balancer"]["plan"] = plan
+        fresh = C.load_db()
+        fresh.setdefault("balancer", {}).update(db["balancer"])
+        C.save_db(fresh)
         keep_enabled(st["nodes"]["MSK"])
 
 
@@ -650,16 +693,25 @@ def heal_panel(nodes):
 
 
 def watchdog_tick():
-    db = C.load_db()
-    if seed(db):
+    with C.LOCK:
+        db = C.load_db()
+        seeded = seed(db)
+        if seeded: C.save_db(db)
+    if db.get("routing_pending"):
+        import routing_admin
+        routing_admin.synchronize()
+        db = C.load_db()
+    if seeded:
         apply(db, compute_plan(db))
         event(db, "Портал взял управление балансировщиком")
-        with C.LOCK:
-            C.save_db(db)
+        save_balancer(db)
     try:
         if check_msk_ip(db):
             with C.LOCK:
-                fresh = C.load_db(); fresh["msk"] = db["msk"]; fresh["balancer"] = db["balancer"]; C.save_db(fresh)
+                fresh = C.load_db()
+                fresh["msk"] = db["msk"]
+                C.save_db(fresh)
+                db = fresh
     except Exception as ex:
         print("msk ip check:", repr(ex), flush=True)
     quiet = starting_up()
@@ -675,6 +727,8 @@ def watchdog_tick():
         if not quiet:
             C.log_error(f"Панель Remnawave не отвечает: {ex}")
     probe_all(db)
+    with C.LOCK:
+        if C.load_db().get("_routing_revision", 0) != db.get("_routing_revision", 0): return
     plan = compute_plan(db)
     old = db["balancer"].get("plan")
     degraded = bool(old) and plan != old and not any(is_up(i) for i in old.get("primary") or [])
@@ -683,7 +737,7 @@ def watchdog_tick():
         event(db, f"{names(db, old['primary'])} недоступен — трафик сам ушёл на резерв {names(db, [old['fallback']])} "
                   "(без перезапуска)" if degraded else f"{names(db, (old or {}).get('primary') or [])} снова доступен")
         with C.LOCK:
-            fresh = C.load_db(); fresh["balancer"] = db["balancer"]; C.save_db(fresh)
+            save_balancer(db)
     if plan != old and must_switch(db, old, plan):
         db["balancer"]["degraded"] = False
         apply(db, plan)
@@ -694,9 +748,7 @@ def watchdog_tick():
         else:
             event(db, f"Резерв: {names(db, [plan['fallback']] if plan['fallback'] else [])}")
         with C.LOCK:
-            fresh = C.load_db()
-            fresh["balancer"] = db["balancer"]
-            C.save_db(fresh)
+            save_balancer(db)
 
 
 def watchdog():
@@ -723,7 +775,8 @@ def job(title, fn, *args):
 
     def run():
         try:
-            fn(log, *args)
+            with JOB_LOCK:
+                fn(log, *args)
             JOBS[jid]["ok"] = True
             if not JOBS[jid].get("confirm"):
                 log("Готово.")
@@ -738,12 +791,9 @@ def job(title, fn, *args):
     return jid
 
 
-def ssh_connect(host, port, password):
-    import paramiko
-    c = paramiko.SSHClient()
-    c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    c.connect(host, port=port, username="root", password=password, timeout=15, allow_agent=False, look_for_keys=False)
-    return c
+def ssh_connect(host, port, password, expected=None):
+    return ssh_trust.connect(host, port, C.P("ssh/known_hosts", "/root/.ssh/geovpn_known_hosts"),
+                             password=password, expected=expected)
 
 
 def ssh_run(c, script, log=None, timeout=900):
@@ -1146,7 +1196,7 @@ def do_add(log, f):
         for target in targets:
             log(f"Подключаюсь по SSH к {target}…")
             try:
-                c = ssh_connect(target, sshport, pw)
+                c = ssh_connect(target, sshport, pw, f.get("ssh_fingerprint") or None)
                 if ":" in target:
                     ip6 = target
                 ssh_target = target
@@ -1196,6 +1246,7 @@ def do_add(log, f):
         e = {"name": name, "cc": cc, "host": host, "ip4": ip4, "ip6": ip6, "port": port, "sni": sni,
              "priv": kp["privateKey"], "pub": kp["publicKey"], "sid": secrets.token_hex(8), "priority": prio,
              "enabled": True, "mon_port": max([x["mon_port"] for x in db["exits"].values()] + [10809]) + 1,
+             "ssh_port": sshport, "ssh_fingerprint": ssh_trust.fingerprint(c.get_transport().get_remote_server_key()),
              "node_port": w["node_port"], "node_dir": w["node_dir"], "node_name": w["node_name"], "fw_name": w["fw_name"],
              "created": C.now_utc().isoformat()}
         if e["mon_port"] in (10803, 10808):
@@ -1260,7 +1311,7 @@ def do_add(log, f):
         log("Обновляю маршрутизацию MSK…")
         apply(db, compute_plan(db))
         with C.LOCK:
-            fresh = C.load_db(); fresh["balancer"] = db["balancer"]; C.save_db(fresh)
+            save_balancer(db)
         log("Жду подключения ноды и проверяю канал (до 2 минут)…")
         for _ in range(24):
             time.sleep(5)
@@ -1316,13 +1367,17 @@ def do_delete(log, eid, pw):
         raise C.UserError("нельзя удалить последний включённый выходной сервер")
     with C.LOCK:
         db = C.load_db()
+        current = db["exits"].get(eid)
+        if not current: raise C.UserError("сервер уже удалён")
+        if current.get("enabled") and sum(bool(x.get("enabled")) for x in db["exits"].values()) <= 1:
+            raise C.UserError("нельзя удалить последний включённый выходной сервер")
         db["exits"].pop(eid)
         event(db, f"Удалён сервер {e['name']}")
         C.save_db(db)
     log("Убираю сервер из маршрутизации MSK…")
     apply(db, compute_plan(db))
     with C.LOCK:
-        fresh = C.load_db(); fresh["balancer"] = db["balancer"]; C.save_db(fresh)
+        save_balancer(db)
     log("Удаляю ноду и профиль в Remnawave…")
     for path in (f"/api/nodes/{e.get('node_uuid')}", f"/api/config-profiles/{e.get('profile_uuid')}"):
         try:
@@ -1338,7 +1393,7 @@ def do_delete(log, eid, pw):
             if not h:
                 continue
             try:
-                c = ssh_connect(h, 22, pw)
+                c = ssh_connect(h, e.get("ssh_port", 22), pw, e.get("ssh_fingerprint"))
                 break
             except Exception as ex:
                 log(f"  {h}: {ex}")
@@ -1395,7 +1450,7 @@ def update_address(eid, form):
         C.rw("PATCH", "/api/nodes", {"uuid": e["node_uuid"], "address": addr})
     apply(db, compute_plan(db))
     with C.LOCK:
-        fresh = C.load_db(); fresh["balancer"] = db["balancer"]; C.save_db(fresh)
+        save_balancer(db)
     STATUS.pop(eid, None); COUNTERS.pop(eid, None)
     bad = dns_mismatch(e, 0)
     dns = (f" Внимание: {host} указывает на {', '.join(bad) or 'ничего'}, а не на {ip4} — обновите A-запись "
@@ -1415,6 +1470,7 @@ def update_exit(eid, form):
         changes = []
         if "priority" in form:
             p = int(form["priority"])
+            if not 1 <= p <= 999: raise C.UserError("Приоритет: число от 1 до 999")
             if p != e["priority"]:
                 changes.append(f"приоритет {e['priority']} → {p}")
                 e["priority"] = p
@@ -1431,7 +1487,7 @@ def update_exit(eid, form):
     plan = compute_plan(db)
     apply(db, plan)
     with C.LOCK:
-        fresh = C.load_db(); fresh["balancer"] = db["balancer"]; C.save_db(fresh)
+        save_balancer(db)
 
 
 # ---------------------------------------------------------------- page
@@ -1450,7 +1506,7 @@ def role_of(db, eid):
     return ("warnp" if not is_up(eid) else "no"), f"резерв {n}" + (" (следующий)" if plan.get("fallback") == eid else "")
 
 
-def render(msg=None, err=None, jid=None, readonly=False):
+def render(msg=None, err=None, jid=None, readonly=False, live=False):
     esc = C.esc
     db = C.load_db()
     nodes = {}
@@ -1541,8 +1597,6 @@ def render(msg=None, err=None, jid=None, readonly=False):
         jobhtml = (f'<div class="card"><h2>{esc(j["title"])} — {state_}</h2>'
                    f'<code style="max-height:none;white-space:pre-wrap">{esc(chr(10).join(j["log"]) or "…")}</code>'
                    + (confirm_form(j["confirm"], pend) if pend and not readonly else "") + '</div>')
-        if not j["done"]:
-            refresh = '<meta http-equiv="refresh" content="3">'
     alert = f'<div class="card ok">{esc(msg)}</div>' if msg else ""
     alert += f'<div class="card err">{esc(err)}</div>' if err else ""
     sni_opts = "".join(f'<option value="{s}">{s}</option>' for s in SNI_CHOICES)
@@ -1550,27 +1604,29 @@ def render(msg=None, err=None, jid=None, readonly=False):
     d4, d6 = detect_msk_addrs()
     dns = dns_a(MSK_DOMAIN)
     dns_ok = s4 in dns
-    add_card = f"""<div class="card"><h2>Добавить сервер</h2>
+    add_card = f"""<dialog id="add-server-dialog"><div class="dialog-heading"><h2>Добавить выходной сервер</h2><button type="button" class="dialog-close" aria-label="Закрыть" onclick="this.closest('dialog').close()">×</button></div>
 <form method="post" action="/admin/servers/add" class="addr">
 <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(200px,1fr))">
 <label>Название<input type="text" name="name" required maxlength="40" placeholder="Франкфурт"></label>
-<label>Код страны<input type="text" name="cc" maxlength="2" placeholder="DE"></label>
 <label>Домен<input type="text" name="host" placeholder="exit3.example.com" list="dl-add"><datalist id="dl-add"></datalist></label>
+<label>root-пароль<input type="password" name="password" required></label>
+<label>Приоритет<input type="text" name="priority" value="{max([e['priority'] for e in db.get('exits', {}).values()] + [0]) + 1}"></label>
+<div class="mut lk" style="grid-column:1/-1;min-height:1.2em"></div>
+</div><details><summary>Адреса и дополнительные настройки</summary><div class="grid" style="margin-top:14px">
+<label>Код страны<input type="text" name="cc" maxlength="2" placeholder="DE"></label>
 <label>IPv4<input type="text" name="ip4" placeholder="из DNS или 1.2.3.4"></label>
 <label>IPv6 (желательно)<input type="text" name="ip6" placeholder="из DNS или 2a01:…::2"></label>
-<div class="mut lk" style="grid-column:1/-1;min-height:1.2em"></div>
-<label>Приоритет<input type="text" name="priority" value="{max([e['priority'] for e in db.get('exits', {}).values()] + [0]) + 1}"></label>
 <label>Сайт-маскировка Reality<select name="sni" style="font:inherit;color:#e8e8e8;background:#0e1015;border:1px solid #343a48;border-radius:8px;padding:9px 12px;width:100%">{sni_opts}</select></label>
 <label>Порт Reality<input type="text" name="port" value="443"></label>
 <label>SSH-порт<input type="text" name="sshport" value="22"></label>
-<label>root-пароль<input type="password" name="password" required></label>
-</div>
+<label>Отпечаток SSH (необязательно)<input type="text" name="ssh_fingerprint" placeholder="SHA256:… из панели хостера"></label>
+</div><p class="hint">Первое подключение сохраняет ключ сервера; последующие проверяют его. Отпечаток из панели хостера защищает и первое подключение.</p></details>
 <button class="btn" style="margin-top:14px">Добавить и установить</button>
 <p class="note">Портал подключится к серверу по SSH, поставит Docker и ноду Remnawave, закроет порт управления для всех,
 кроме MSK, создаст ключи и включит сервер в цепочку. Пароль используется один раз и нигде не сохраняется.
 Достаточно указать домен — IPv4/IPv6 подтянутся из DNS (и сверятся с самим сервером),
 или IP — портал подскажет домены, которые на него указывают. Требования: чистый Linux-сервер (Ubuntu/Debian) вне РФ, свободный порт Reality. Если IPv4 сервера окажется заблокирован
-в РФ, мост автоматически пойдёт по IPv6.</p></form></div>
+в РФ, мост автоматически пойдёт по IPv6.</p></form></dialog>
 """
     msk_card = (f'<div class="kv"><span>Адрес MSK (разрешён в файрволах выходов)</span><span>{esc(s4)} · {esc(s6 or "—")}</span></div>'
                 f'<div class="kv"><span>Фактический адрес сервера</span><span>{esc(d4 or "?")} · {esc(d6 or "—")}</span></div>'
@@ -1583,19 +1639,24 @@ def render(msg=None, err=None, jid=None, readonly=False):
                 + '<p class="note">Если у MSK сменится IP, сторож сам заметит это в течение минуты и обновит адрес в файрволах '
                   'всех выходов (ограниченным ключом, который умеет только это), а здесь появится напоминание сменить A-запись в DNS. '
                   'Ссылки у пользователей не меняются — они указывают на домен.</p>')
-    body = f"""{refresh}<div class="wrap">
-<h1>{C.BRAND} — серверы</h1>
-<div class="sub"><a class="inline" href="/admin">← пользователи и мониторинг</a> · <a class="inline" href="/admin/servers">обновить</a></div>
-{alert}{jobhtml}
+    if live:
+        return {"rows": rows or '<tr><td colspan="8" class="mut">нет серверов</td></tr>', "chain": chain_html,
+                "job": jobhtml, "events": events, "errors": errors_html,
+                "overview": f"Всего {len(db.get('exits', {}))} · включено {len(en)} · основной: {names(db, prim)}"}
+    body = f"""{refresh}<div class="wrap">{C.admin_nav('servers', 'u' if readonly else 'a')}
+<h1>Серверы и резервирование</h1>
+<div class="sub"><span id="live-state">обновляется автоматически</span></div>
+<div class="card server-overview"><div><h2>Выходные серверы</h2><p id="server-overview" class="hint">Всего {len(db.get('exits', {}))} · включено {len(en)} · основной: {esc(names(db, prim))}</p></div>{'' if readonly else '<button class="btn" type="button" onclick="document.getElementById(\'add-server-dialog\').showModal()">+ Добавить сервер</button>'}</div>
+{alert}<div id="server-job">{jobhtml}</div>
 {'<div class="card"><span class="pill no">режим просмотра</span> <span class="mut">вход модератора: управление серверами доступно только администратору</span></div>' if readonly else ''}
-<div class="card"><h2>Цепочка сейчас</h2><p class="hint" style="font-size:1rem">{chain_html}</p>
+<div class="card"><h2>Цепочка сейчас</h2><p id="server-chain" class="hint" style="font-size:1rem">{chain_html}</p>
 <p class="note">Сплошная стрелка — куда идёт трафик сейчас, пунктир — очередь резерва. Сторож проверяет каждый сервер
 раз в {PROBE_EVERY} с; сервер считается упавшим после {FAILS_TO_DOWN} неудачных проверок подряд и возвращается после {OKS_TO_UP} удачных.
 Мгновенно (за ~15–20 с) трафик уходит на следующий резерв средствами xray, затем сторож перестраивает очередь.
 Каждое перестроение перезапускает xray на MSK — у клиентов возможен разрыв на 1–2 секунды.</p></div>
 <div class="card"><h2>Выходные серверы</h2><div class="scroll"><table>
-<tr><th>Приоритет</th><th>Сервер</th><th>Адреса</th><th>Роль</th><th>Канал с MSK</th><th class="hide-sm">Семейства</th><th class="hide-sm">Нода</th><th>Действия</th></tr>
-{rows or '<tr><td colspan="8" class="mut">нет серверов</td></tr>'}</table></div>
+<thead><tr><th>Приоритет</th><th>Сервер</th><th>Адреса</th><th>Роль</th><th>Канал с MSK</th><th class="hide-sm">Семейства</th><th class="hide-sm">Нода</th><th>Действия</th></tr></thead>
+<tbody id="server-rows">{rows or '<tr><td colspan="8" class="mut">нет серверов</td></tr>'}</tbody></table></div>
 <p class="note"><b>Приоритет:</b> 1 — основной, 2 — первый резерв и т. д. Серверы с одинаковым приоритетом работают вместе:
 трафик идёт через тот, у которого меньше задержка. «Вывести из работы» — сервер остаётся настроенным, но трафик на него не идёт.</p></div>
 {"" if readonly else add_card}<details class="card" style="padding:14px 18px"><summary style="cursor:pointer;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
@@ -1603,9 +1664,9 @@ def render(msg=None, err=None, jid=None, readonly=False):
 <span class="pill {"off" if recent_err else "no"}">ошибок за сутки: {recent_err}</span>
 <span class="mut">{last_err}</span></summary>
 <div class="grid" style="margin-top:14px;grid-template-columns:repeat(auto-fit,minmax(320px,1fr))">
-<div class="card"><h2>Переключения</h2>{events}</div>
-<div class="card"><h2>Критические ошибки</h2>{errors_html}</div></div></details>
-<div class="card"><h2>Вход MSK</h2>{msk_card}</div>
+<div class="card"><h2>Переключения</h2><div id="server-events">{events}</div></div>
+<div class="card"><h2>Критические ошибки</h2><div id="server-errors">{errors_html}</div></div></div></details>
+<details class="card"><summary>Входной сервер · адреса и DNS</summary>{msk_card}</details>
 </div>"""
     return C.page(f"{C.BRAND} — серверы", body, ADDR_JS)
 
@@ -1634,7 +1695,8 @@ def confirm_form(token, pend):
 
 
 ADDR_JS = r"""
-document.querySelectorAll('form.addr').forEach(function (f) {
+function bindAddressForms() {document.querySelectorAll('form.addr:not([data-bound])').forEach(function (f) {
+  f.dataset.bound = '1';
   var h = f.elements.host, v4 = f.elements.ip4, v6 = f.elements.ip6, lk = f.querySelector('.lk'), dl = h.list;
   function get(q, cb) { fetch('/admin/servers/lookup?' + q, {credentials: 'same-origin'}).then(function (r) { return r.json(); }).then(cb, function () {}); }
   function note(t) { if (lk) lk.textContent = t; }
@@ -1665,11 +1727,13 @@ document.querySelectorAll('form.addr').forEach(function (f) {
       });
     });
   });
-});
+});}bindAddressForms();
 """
 
 
 def handle_get(h, path, q, readonly=False):
+    if path == "/admin/servers/live":
+        return h.send(200, json.dumps(render(jid=q.get("job", [None])[0], readonly=readonly, live=True)), "application/json")
     if path in ("/admin/servers", "/admin/servers/"):
         return h.send(200, render(q.get("msg", [None])[0], q.get("err", [None])[0], q.get("job", [None])[0], readonly))
     if path == "/admin/servers/lookup":

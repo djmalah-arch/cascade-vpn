@@ -59,6 +59,7 @@ services:
       - ./data/Caddyfile:/etc/caddy/Caddyfile:ro
       - ./data/caddy:/data
       - ./data/apps:/srv/app:ro
+      - ./data/public-run:/run/geovpn-public:ro
     <<: *log
 
   # ---------------------------------------------------------------- xray (Reality + Hysteria2 on :443), managed by the panel
@@ -121,6 +122,26 @@ services:
     <<: *log
 
   # ---------------------------------------------------------------- portal (admin, pages, balancer watchdog, backups...)
+  public:
+    image: geovpn/portal
+    build: { context: ., dockerfile: portal/Dockerfile }
+    container_name: geovpn-public
+    restart: always
+    network_mode: none
+    user: "65534:65534"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    environment:
+      - GEOVPN_ROLE=public
+      - GEOVPN_PUBLIC_DIR=/public
+      - GEOVPN_PUBLIC_SOCKET=/run/geovpn-public/http.sock
+    volumes:
+      - ./data/public:/public:ro
+      - ./data/public-run:/run/geovpn-public
+      - ./data/apps:/opt/geovpn-portal/app:ro
+    <<: *log
+
   portal:
     build: { context: ., dockerfile: portal/Dockerfile }
     image: geovpn/portal
@@ -130,11 +151,15 @@ services:
     cap_add: [NET_ADMIN]
     environment:
       - GEOVPN_DATA=/data
+      - GEOVPN_PUBLIC_DIR=/public-state
+      - GEOVPN_PROJECT_DATA=/host-data
       - NODE_IMAGE=${NODE_IMAGE:-remnawave/node@sha256:0cdf386dd49f360fc885bb34bde21132e478e40f0deac62d616086ec0fa9257e}
       - CADDY_DATA=/caddy-data
       - NODE_GW=172.28.0.1
     volumes:
       - ./data/portal:/data
+      - ./data/public:/public-state
+      - ./data:/host-data:ro
       - ./data/awg:/etc/amnezia/amneziawg
       - awg-run:/var/run/amneziawg
       - ./data/mtproxy:/etc/geovpn/mtproxy
