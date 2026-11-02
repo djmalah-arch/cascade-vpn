@@ -46,7 +46,7 @@ done
 
 # ------------------------------------------------------------------ 0. questions
 echo
-c_info "Cascade VPN — установка входного сервера (Россия)"
+c_info "Установка входного VPN-сервера (Россия)"
 if [ -f "$DATA/install.env" ]; then
   c_warn "найдена предыдущая установка ($DATA/install.env) — значения будут взяты оттуда"
   set -a; . "$DATA/install.env"; set +a
@@ -67,7 +67,7 @@ while ! printf '%s' "$BRAND" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1; do
   [ -t 0 ] || die "BRAND не в UTF-8"
   BRAND=; ask BRAND "Название сервиса (видно пользователям)" "GeoVPN"
 done
-ask RW_ADMIN_USER "Логин администратора панели Remnawave" "geoadmin"
+ask RW_ADMIN_USER "Логин администратора панели Remnawave" "admin"
 # re-run: keep passwords that were already set
 if [ -f "$DATA/portal/secrets.env" ]; then
   : "${RW_ADMIN_PASS:=$(grep '^RW_ADMIN_PASS=' "$DATA/portal/secrets.env" | cut -d= -f2-)}"
@@ -235,7 +235,7 @@ docker exec geovpn-portal geovpn ensure-node >/dev/null || true   # the profile 
 # ------------------------------------------------------------------ result
 LOGIN="https://$DOMAIN/?k=$PANEL_COOKIE"
 cat > "$CRED" <<EOF
-===================== Cascade VPN — доступы ($(date '+%d.%m.%Y %H:%M')) =====================
+===================== $BRAND — доступы ($(date '+%d.%m.%Y %H:%M')) =====================
 Сервер: $SERVER_IP   Домен: $DOMAIN   Сервис: $BRAND
 
 1) Вход в портал: сначала ОДИН раз открыть в браузере секретную ссылку (cookie на год):

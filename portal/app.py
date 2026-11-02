@@ -1219,7 +1219,7 @@ def render_admin(msg=None, err=None, hl=None, role="u", gfilter=None, live=False
         rv = db.get("ru_via_msk", {}).get(str(u["rw_id"]))
         ru_warn = (f' <span class="pill warnp" title="Российские сайты этого пользователя идут через сервер '
                    f'({rv["ru"]} из {rv["total"]} соединений), а не напрямую с устройства: в Hiddify не выбран регион '
-                   f'«Россия», в Happ не включена маршрутизация GeoVPN. Avito и банки могут не открываться.">'
+                   f'«Россия», в Happ не включена маршрутизация {esc(BRAND)}. Avito и банки могут не открываться.">'
                    f'RU через сервер · {ago(parse_ts(rv["last"]))}</span>') if rv else ""
         act = lambda a_, label, cls="alt", conf="": (
             f'<form method="post" action="/admin/u/{esc(slug)}/{a_}" style="display:inline"'
@@ -1338,7 +1338,7 @@ document.addEventListener("DOMContentLoaded", () => {
 <th class="hide-sm">Amnezia<br><span class="mut">трафик* · активность</span></th><th class="hide-sm">Telegram<br><span class="mut">трафик* · сейчас</span></th><th>Подключение</th></tr></thead>
 <tbody id="user-rows">{rows or '<tr><td colspan="9" class="mut">Пока никого нет</td></tr>'}</tbody>
 </table></div><details><summary>О статусах и статистике</summary><p class="note">* трафик Amnezia и Telegram считается с последнего перезапуска службы. «+1 год» продлевает от текущей даты окончания.
-«RU через сервер» — у пользователя российские сайты идут через сервер, а не напрямую: в Hiddify не выбран регион «Россия» (шаг 3 на его странице), в Happ не включена маршрутизация GeoVPN. Проверка раз в 10 минут, метка держится 3 дня.</p></details></div>
+«RU через сервер» — у пользователя российские сайты идут через сервер, а не напрямую: в Hiddify не выбран регион «Россия» (шаг 3 на его странице), в Happ не включена маршрутизация {esc(BRAND)}. Проверка раз в 10 минут, метка держится 3 дня.</p></details></div>
 </div><dialog id="user-actions-dialog" class="user-dialog"><div class="dialog-heading"><div><h2 id="user-actions-title"></h2><p class="hint">Управление доступом</p></div><button class="dialog-close" type="button" aria-label="Закрыть" onclick="this.closest('dialog').close()">×</button></div><div id="user-actions-content" class="user-action-list"></div></dialog>"""
     return page(f"{BRAND} — управление", body)
 
@@ -1461,7 +1461,7 @@ def option(oid, icon, color, title, badges, desc, plat, body):
 def render_user(u, client_ip):
     r = rw_user_by_id(u["rw_id"])
     name = u["name"]
-    head = f'<div class="wrap narrow"><h1>{BRAND}</h1><div class="sub">Персональная страница подключения — {esc(name)}</div>'
+    head = f'<div class="wrap narrow"><h1>{esc(BRAND)}</h1><div class="sub">Персональная страница подключения — {esc(name)}</div>'
     if u.get("blocked") or not r or r["status"] != "ACTIVE":
         reason = {"EXPIRED": "Срок действия доступа истёк.", "DISABLED": "Доступ приостановлен.",
                   "LIMITED": "Исчерпан лимит трафика."}.get((r or {}).get("status"), "Доступ недоступен.")
@@ -1486,8 +1486,8 @@ def render_user(u, client_ip):
              connect_block(sub, "m", "happ-uri", sub, f'<a class="btn" href="happ://add/{esc(sub)}">Открыть в Happ</a>',
                            "Кнопка сама добавит подключение в Happ. Или отсканируйте QR-код в приложении (кнопка «+» → QR), или скопируйте ссылку и добавьте её из буфера обмена:"))
         + step(3, "Подключитесь",
-             '<ol><li>Если Happ спросит про профиль маршрутизации <b>GeoVPN</b> — согласитесь: с ним российские сайты работают напрямую.</li>'
-             '<li>В списке выберите <b>GeoVPN авто</b> и нажмите большую кнопку подключения. Happ сам выбирает лучший способ подключения '
+             f'<ol><li>Если Happ спросит про профиль маршрутизации <b>{esc(BRAND)}</b> — согласитесь: с ним российские сайты работают напрямую.</li>'
+             f'<li>В списке выберите <b>{esc(BRAND)} авто</b> и нажмите большую кнопку подключения. Happ сам выбирает лучший способ подключения '
              'и переключается, если один не работает в этой сети (например, на Wi-Fi, где его режут).</li>'
              '<li>Для игр на Windows включите режим «Системный прокси» — игры пойдут мимо VPN. На Android игры можно исключить в «Раздельном туннелировании».</li></ol>'
              '<p class="note">Настройки обновляются сами: если на сервере что-то изменится, приложение получит это автоматически.</p>'))
@@ -1634,9 +1634,9 @@ def need_for(path):
 
 def render_login(err=None, nxt="/admin"):
     nxt = safe_next(nxt)
-    what = "Панель Remnawave" if need_for(nxt) == "a" else "Управление GeoVPN"
+    what = "Панель Remnawave" if need_for(nxt) == "a" else f"Управление {esc(BRAND)}"
     return page(f"{BRAND} — вход", f"""<div class="wrap" style="max-width:420px">
-<h1>{BRAND} — вход</h1><div class="sub">{what}: требуется пароль.</div>
+<h1>{esc(BRAND)} — вход</h1><div class="sub">{what}: требуется пароль.</div>
 {f'<div class="card err">{esc(err)}</div>' if err else ''}
 <div class="card"><form method="post" action="/login">
 <input type="hidden" name="next" value="{esc(nxt)}">
@@ -1707,7 +1707,7 @@ class H(BaseHTTPRequestHandler):
                     if u.get("blocked") or not r or r["status"] != "ACTIVE":
                         return self.not_found()
                     return self.send(200, awg_client_conf(u["awg"]), "application/octet-stream",
-                                     {"Content-Disposition": f'attachment; filename="geovpn-{slug}.conf"'})
+                                     {"Content-Disposition": f"attachment; filename=\"vpn-{slug}.conf\"; filename*=UTF-8''{quote(BRAND + '-' + slug + '.conf', safe='')}"})
                 return self.send(200, render_user(u, self.client_ip()))
             if p == "/auth/check":   # Caddy forward_auth for the Remnawave panel
                 if has_role(self.headers.get("Cookie"), "a"):

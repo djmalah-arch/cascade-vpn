@@ -56,7 +56,8 @@ def happ_routing():
     print("happ routing profile: ok")
 
 
-HAPP_AUTO_TEMPLATE, HAPP_AUTO_HOST = "GeoVPN Happ auto", "GeoVPN авто"
+HAPP_AUTO_TEMPLATE, HAPP_AUTO_HOST = "Happ auto", "GeoVPN авто"
+HAPP_AUTO_TEMPLATE_NAMES = (HAPP_AUTO_TEMPLATE, "GeoVPN Happ auto")
 
 
 def happ_auto():
@@ -107,16 +108,17 @@ def happ_auto():
         "outbounds": [{"tag": "direct", "protocol": "freedom"}, {"tag": "block", "protocol": "blackhole"}],
     }
     t = next((t for t in app.rw("GET", "/api/subscription-templates")["templates"]
-              if t["templateType"] == "XRAY_JSON" and t.get("name") == HAPP_AUTO_TEMPLATE), None)
+              if t["templateType"] == "XRAY_JSON" and t.get("name") in HAPP_AUTO_TEMPLATE_NAMES), None)
     if not t:
         t = app.rw("POST", "/api/subscription-templates", {"name": HAPP_AUTO_TEMPLATE, "templateType": "XRAY_JSON"})
-    app.rw("PATCH", "/api/subscription-templates", {"uuid": t["uuid"], "templateJson": tj})
+    app.rw("PATCH", "/api/subscription-templates", {"uuid": t["uuid"], "name": HAPP_AUTO_TEMPLATE, "templateJson": tj})
     # virtual host: only its remark and template matter; it is shown in JSON subscriptions only
     others = ["XRAY_BASE64", "MIHOMO", "STASH", "CLASH", "SINGBOX"]
-    body = {"remark": HAPP_AUTO_HOST, "address": reality["address"], "port": reality["port"], "inbound": reality["inbound"],
+    body = {"remark": f"{app.BRAND} авто", "address": reality["address"], "port": reality["port"], "inbound": reality["inbound"],
             "sni": reality["sni"], "fingerprint": "chrome", "excludeFromSubscriptionTypes": others,
             "xrayJsonTemplateUuid": t["uuid"]}
-    v = hosts.get(HAPP_AUTO_HOST)
+    # The template UUID identifies our managed host even after a brand change.
+    v = next((h for h in hosts.values() if h.get("xrayJsonTemplateUuid") == t["uuid"]), None) or hosts.get(HAPP_AUTO_HOST)
     if v:
         app.rw("PATCH", "/api/hosts", {"uuid": v["uuid"], **body})
     else:
@@ -128,10 +130,10 @@ def happ_auto():
     # Happ gets XRAY_JSON (rule must precede the base64 fallback)
     s = app.rw("GET", "/api/subscription-settings")
     rr = s["responseRules"]
-    rules = [r for r in rr["rules"] if r.get("name") != "Happ JSON (GeoVPN)"]
+    rules = [r for r in rr["rules"] if r.get("name") not in ("Happ JSON (GeoVPN)", "Happ JSON (auto)")]
     rules.insert(next(i for i, r in enumerate(rules) if r["responseType"] == "XRAY_BASE64"), {
-        "name": "Happ JSON (GeoVPN)", "enabled": True, "operator": "AND", "responseType": "XRAY_JSON",
-        "description": "Happ: 'GeoVPN авто' with auto-switch Hysteria2/Reality (geovpn happ-auto)",
+        "name": "Happ JSON (auto)", "enabled": True, "operator": "AND", "responseType": "XRAY_JSON",
+        "description": f"Happ: '{app.BRAND} авто', Hysteria2/Reality",
         "conditions": [{"headerName": "user-agent", "operator": "REGEX", "value": "^happ/", "caseSensitive": False}]})
     app.rw("PATCH", "/api/subscription-settings", {"uuid": s["uuid"], "responseRules": {**rr, "rules": rules}})
     print("happ auto (JSON + balancer): ok")
@@ -141,7 +143,7 @@ def templates():
     """DNS without Cloudflare (throttled in RU) + direct rules for sing-box clients."""
     direct = routing_policy.direct_config(app.load_db(), app.read_json(app.DIRECT_JSON))
     for t in app.rw("GET", "/api/subscription-templates")["templates"]:
-        if t["templateType"] not in ("XRAY_JSON", "SINGBOX") or t.get("name") == HAPP_AUTO_TEMPLATE:
+        if t["templateType"] not in ("XRAY_JSON", "SINGBOX") or t.get("name") in HAPP_AUTO_TEMPLATE_NAMES:
             continue
         tj = app.rw("GET", "/api/subscription-templates/" + t["uuid"])["templateJson"]
         if t["templateType"] == "XRAY_JSON":

@@ -966,7 +966,7 @@ if [ -f $D/docker-compose.yml ] && grep -qE '^# geovpn-exit|geovpn-fw|remnawave/
   cd $D && docker compose down --rmi local 2>&1 | tail -1
   cd / && rm -rf $D
 else
-  echo "в $D нет установки GeoVPN — ничего не удаляю"
+  echo "в $D нет управляемой установки VPN — ничего не удаляю"
 fi
 # the portal key stays while this MSK still has other nodes here
 # ...and so do MSK's backups (they hold all secrets) with the key that writes them
@@ -1099,7 +1099,7 @@ def preflight(c, want, sshport=22):
         conflicts.append("Имена контейнеров ноды и файрвола совпадают")
     if want["node_dir"] in used_dirs:
         conflicts.append(f"Папка {want['node_dir']} уже существует"
-                         + (" — там прежняя установка GeoVPN (возможно, от другого входного сервера)" if want["node_dir"] in ours else ""))
+                         + (" — там прежняя управляемая установка VPN (возможно, от другого входного сервера)" if want["node_dir"] in ours else ""))
     if want["node_name"] in names or want["fw_name"] in names or want["node_name"] == want["fw_name"] or want["node_dir"] in used_dirs:
         for k in range(1, 100):
             base = "geovpn-node" + ("" if k == 1 else f"-{k}")
