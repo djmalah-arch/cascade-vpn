@@ -39,6 +39,10 @@ ask_secret() {  # empty answer -> generated ("rw" = Remnawave rules: 24+ chars, 
 
 [ "$(id -u)" = 0 ] || die "run as root"
 [ -f docker-compose.yml ] || die "run from the repository directory"
+export DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1
+for tool in curl openssl python3 iconv; do
+  command -v "$tool" >/dev/null || { apt-get update -qq && apt-get install -y -qq curl ca-certificates openssl python3 libc-bin; break; }
+done
 
 # ------------------------------------------------------------------ 0. questions
 echo
@@ -47,11 +51,15 @@ if [ -f "$DATA/install.env" ]; then
   c_warn "найдена предыдущая установка ($DATA/install.env) — значения будут взяты оттуда"
   set -a; . "$DATA/install.env"; set +a
   RERUN=1
+  # A restored install.env describes the old VPS; detect the new machine's address.
+  unset SERVER_IP
 fi
 DETECTED_IP=$(curl -4 -s -m 8 https://api.ipify.org || ip -4 route get 1.1.1.1 | awk '{print $7; exit}')
 ask SERVER_IP "Публичный IPv4 этого сервера" "$DETECTED_IP"
 ask DOMAIN "Домен входного сервера (A-запись -> $SERVER_IP)" ""
+DOMAIN=${DOMAIN,,}
 [ -n "$DOMAIN" ] || die "домен обязателен (для теста можно ${SERVER_IP//./-}.sslip.io)"
+[[ "$DOMAIN" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] || die "некорректный домен"
 ask BRAND "Название сервиса (видно пользователям)" "GeoVPN"
 # a terminal not in UTF-8 (or backspace over a Cyrillic letter) leaves broken bytes -> portal can't start
 while ! printf '%s' "$BRAND" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1; do
@@ -77,6 +85,10 @@ ask_secret ADMIN_PASS "Пароль АДМИНИСТРАТОРА портала 
 ask_secret MOD_PASS "Пароль МОДЕРАТОРА портала (только группа work, серверы — просмотр)"
 ask AWG_PORT "UDP-порт AmneziaWG" "$(shuf -i 30000-60000 -n1)"
 ask MTP_PORT "TCP-порт прокси Telegram (MTProxy)" "9443"
+for v in AWG_PORT MTP_PORT; do
+  [[ ${!v} =~ ^[0-9]+$ ]] && (( ${!v} >= 1024 && ${!v} <= 65535 )) || die "$v: порт должен быть от 1024 до 65535"
+done
+[[ "$AWG_PORT" != 443 && "$MTP_PORT" != 443 ]] || die "порт 443 зарезервирован"
 
 RESOLVED=$(getent ahostsv4 "$DOMAIN" | awk '{print $1; exit}' || true)
 if [ "$RESOLVED" != "$SERVER_IP" ]; then
@@ -90,7 +102,10 @@ if [ -z "${RERUN:-}" ]; then   # on re-run these ports are held by our own conta
   ss -lun "sport = :443" | grep -q UNCONN && die "UDP-порт 443 уже занят"
 fi
 
-mkdir -p "$DATA"/{portal,awg,mtproxy,apps,caddy,zapret}
+mkdir -p "$DATA"/{portal,public,public-run,awg,mtproxy,apps,caddy,zapret}
+chmod 755 "$DATA/public"
+chown 65534:65534 "$DATA/public-run"
+chmod 750 "$DATA/public-run"
 chmod 700 "$DATA"
 for v in SERVER_IP DOMAIN BRAND RW_ADMIN_USER AWG_PORT MTP_PORT; do printf '%s=%q
 ' "$v" "${!v}"; done > "$DATA/install.env"
@@ -155,7 +170,7 @@ fi
 
 # ------------------------------------------------------------------ 2. configs + secrets
 c_info "2/6 Конфигурация и секреты"
-kv() { grep -q "^$1=" "$2" 2>/dev/null && sed -i "s|^$1=.*|$1=$3|" "$2" || echo "$1=$3" >> "$2"; }
+kv() { python3 portal/envfile.py "$2" "$1" "$3"; }
 SEC=$DATA/portal/secrets.env
 touch "$SEC"; chmod 600 "$SEC"
 grep -q '^PANEL_COOKIE=' "$SEC" || echo "PANEL_COOKIE=$(openssl rand -hex 24)" >> "$SEC"
@@ -168,7 +183,7 @@ printf 'DOMAIN=%s\nBRAND=%s\nMTP_PORT=%s\nMTP_DOMAIN=ya.ru\n' "$DOMAIN" "$BRAND"
 
 RWENV=$DATA/remnawave.env
 if [ ! -f "$RWENV" ]; then
-  curl -fsSL https://raw.githubusercontent.com/remnawave/backend/refs/heads/main/.env.sample -o "$RWENV"
+  cp config/remnawave.env.sample "$RWENV"  # backend 3.4.4, commit b22970cc88481a7e278b5767721672a18f8b2ada
   PG=$(openssl rand -hex 24)
   sed -i -e "s|^APP_SECRET=.*|APP_SECRET=$(openssl rand -hex 64)|" \
          -e "s|^METRICS_PASS=.*|METRICS_PASS=$(openssl rand -hex 32)|" \
@@ -187,7 +202,14 @@ docker compose --progress quiet pull remnawave-db remnawave-redis remnawave cadd
 
 # ------------------------------------------------------------------ 4. panel + web + certificate
 c_info "4/6 Панель Remnawave и сертификат для $DOMAIN"
-docker compose --progress quiet up -d remnawave-db remnawave-redis remnawave caddy
+docker compose --progress quiet up -d remnawave-db remnawave-redis
+if [ -f "$DATA/restore.dump" ]; then
+  c_info "Восстанавливаю PostgreSQL из резервной копии до запуска панели"
+  for i in $(seq 1 60); do docker exec remnawave-db pg_isready -U postgres >/dev/null 2>&1 && break; sleep 2; done
+  docker exec -i remnawave-db pg_restore --clean --if-exists --no-owner --exit-on-error -U postgres -d postgres < "$DATA/restore.dump"
+  mv "$DATA/restore.dump" "$DATA/restore.dump.applied"
+fi
+docker compose --progress quiet up -d remnawave caddy
 CERT="$DATA/caddy/caddy/certificates/acme-v02.api.letsencrypt.org-directory/$DOMAIN/$DOMAIN.crt"
 for i in $(seq 1 60); do [ -s "$CERT" ] && break; sleep 5; done
 [ -s "$CERT" ] || die "сертификат для $DOMAIN не выпущен: проверьте DNS и что порт 80 открыт (docker logs geovpn-caddy)"
@@ -200,7 +222,8 @@ docker compose --progress quiet run --rm --no-deps -e AWG_PORT="$AWG_PORT" -e RW
 # ------------------------------------------------------------------ 6. everything else
 c_info "6/6 Запуск всех служб"
 docker compose --progress quiet up -d
-for i in $(seq 1 40); do curl -s -o /dev/null -m 3 http://127.0.0.1:8090/sub/x && break; sleep 3; done
+for i in $(seq 1 40); do curl -fsS -o /dev/null -m 3 http://127.0.0.1:8090/healthz && break; sleep 3; done
+curl -fsS -o /dev/null -m 5 http://127.0.0.1:8090/healthz || die "портал не прошёл проверку готовности"
 docker exec geovpn-portal geovpn ensure-node >/dev/null || true
 for i in $(seq 1 30); do ss -ltn "sport = :443" | grep -q LISTEN && break; sleep 3; done
 ss -ltn "sport = :443" | grep -q LISTEN && c_ok "   xray слушает 443 (Reality + Hysteria2)" || c_warn "xray пока не слушает 443 — см. docker logs remnanode"
@@ -230,7 +253,7 @@ cat > "$CRED" <<EOF
 ДАЛЬШЕ:
  - Добавить зарубежные (выходные) серверы: /admin/servers -> «Добавить сервер»
    (чистый Ubuntu/Debian вне РФ + root-пароль; портал всё поставит сам). Пока выходов нет,
-   заблокированные сайты не откроются — всё идёт напрямую с этого сервера.
+   зарубежный трафик заблокирован до добавления выхода.
  - Завести пользователей: /admin -> «Новый пользователь» -> «Копировать» приглашение.
  - Сменить пароль: docker exec geovpn-portal geovpn set-password admin|users 'новый'
 Файл с этими данными: $CRED (храните в менеджере паролей и удалите с сервера).

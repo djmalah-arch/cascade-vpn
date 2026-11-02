@@ -6,4 +6,7 @@ ARG MTPROTOPROXY_REF=0614c35020943b2080c9bd27b5e6336270af389f
 RUN apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/* \
  && pip install --no-cache-dir cryptography==50.0.1 pysocks==1.7.1 \
  && git clone https://github.com/alexbers/mtprotoproxy /opt/mtprotoproxy && cd /opt/mtprotoproxy && git checkout "$MTPROTOPROXY_REF"
+COPY revocation.py /opt/mtprotoproxy/revocation.py
+COPY patch_proxy.py /tmp/patch_proxy.py
+RUN python /tmp/patch_proxy.py && rm /tmp/patch_proxy.py
 CMD ["python", "/opt/mtprotoproxy/mtprotoproxy.py", "/etc/geovpn/mtproxy/config.py"]

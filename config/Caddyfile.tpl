@@ -18,15 +18,20 @@ http://{{DOMAIN}} {
 {{DOMAIN}}:8443 {
 	bind 127.0.0.1
 	encode
+	@routeCheck path /route-check
+	handle @routeCheck {
+		header Cache-Control no-store
+		respond "{http.request.remote.host}" 200
+	}
 	@sub path /api/sub/*
 	handle @sub {
 		reverse_proxy 127.0.0.1:3000
 	}
 	handle /sub/* {
-		reverse_proxy 127.0.0.1:8090
+		reverse_proxy unix//run/geovpn-public/http.sock
 	}
 	handle /c/* {
-		reverse_proxy 127.0.0.1:8090
+		reverse_proxy unix//run/geovpn-public/http.sock
 	}
 	handle_path /app/* {
 		root * /srv/app

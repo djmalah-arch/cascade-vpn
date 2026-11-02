@@ -15,6 +15,8 @@ import base64, hashlib, json, os, secrets, sys, time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import app  # noqa: E402  (config, Remnawave API helper, portal db)
+import routing_policy
+from envfile import set_values
 
 
 def direct_lists(direct):
@@ -25,7 +27,7 @@ def direct_lists(direct):
 
 
 def happ_routing():
-    direct = json.load(open(app.DIRECT_JSON))
+    direct = routing_policy.direct_config(app.load_db(), app.read_json(app.DIRECT_JSON))
     sites, ips = direct_lists(direct)
     profile = {
         "Name": app.BRAND, "GlobalProxy": "true",
@@ -60,7 +62,7 @@ HAPP_AUTO_TEMPLATE, HAPP_AUTO_HOST = "GeoVPN Happ auto", "GeoVPN авто"
 def happ_auto():
     """Happ JSON subscription: one 'GeoVPN авто' config whose balancer picks Hysteria2 or Reality by probe,
     so Happ survives Wi-Fi that drops UDP. Same direct rules/DNS as the Happ routing profile."""
-    direct = json.load(open(app.DIRECT_JSON))
+    direct = routing_policy.direct_config(app.load_db(), app.read_json(app.DIRECT_JSON))
     sites, ips = direct_lists(direct)
     hosts = {h["remark"]: h for h in app.rw("GET", "/api/hosts")}
     hy2, reality = hosts["RU MSK Hysteria2"], hosts["RU MSK Reality"]
@@ -85,7 +87,8 @@ def happ_auto():
             "balancers": [{"tag": "auto", "selector": ["proxy"], "strategy": {"type": "leastPing"},
                            "fallbackTag": "proxy-2"}],
             "rules": [
-                {"type": "field", "protocol": ["bittorrent"], "outboundTag": "direct"},
+                {"type": "field", "protocol": ["bittorrent"], "outboundTag": "block"},
+            ] + routing_policy.rules(app.load_db(), {}, client=True) + [
                 {"type": "field", "domain": ["geosite:youtube"], "balancerTag": "auto"},   # RU IP + DPI bypass on MSK
                 {"type": "field", "domain": sites, "outboundTag": "direct"},
                 {"type": "field", "ip": ips, "outboundTag": "direct"},
@@ -136,7 +139,7 @@ def happ_auto():
 
 def templates():
     """DNS without Cloudflare (throttled in RU) + direct rules for sing-box clients."""
-    direct = json.load(open(app.DIRECT_JSON))
+    direct = routing_policy.direct_config(app.load_db(), app.read_json(app.DIRECT_JSON))
     for t in app.rw("GET", "/api/subscription-templates")["templates"]:
         if t["templateType"] not in ("XRAY_JSON", "SINGBOX") or t.get("name") == HAPP_AUTO_TEMPLATE:
             continue
@@ -152,7 +155,8 @@ def templates():
             rules = [r for r in tj["route"]["rules"]
                      if not (r.get("outbound") == "direct" and ("domain_suffix" in r or "ip_cidr" in r or "port_range" in r))]
             pos = next((i + 1 for i, r in enumerate(rules) if r.get("action") == "hijack-dns"), len(rules))
-            rules.insert(pos, {"domain_suffix": direct["domains"], "ip_cidr": direct["ips"], "outbound": "direct"})
+            if direct["domains"] or direct["ips"]:
+                rules.insert(pos, {"domain_suffix": direct["domains"], "ip_cidr": direct["ips"], "outbound": "direct"})
             if direct.get("udp_ports"):
                 rules.insert(pos + 1, {"network": "udp", "port_range": [p.replace("-", ":") for p in direct["udp_ports"]],
                                        "outbound": "direct"})
@@ -195,10 +199,8 @@ def set_password(which, pw):
     salt = secrets.token_hex(16)
     h = hashlib.pbkdf2_hmac("sha256", pw.encode(), bytes.fromhex(salt), 200000).hex()
     for path, k, v in ((app.PORTAL_ENV, key, f"{salt}${h}"), (app.SECRETS, plain, pw)):
-        lines = [l for l in open(path).read().splitlines() if not l.startswith(k + "=")] if os.path.exists(path) else []
-        lines.append(f"{k}={v}")
-        open(path, "w").write("\n".join(lines) + "\n")
-        os.chmod(path, 0o600)
+        with app.LOCK:
+            set_values(path, {k: v})
     print(f"password for '{which}' changed (open sessions stay valid up to 12 h)")
 
 
@@ -239,13 +241,17 @@ def main():
         c = None
         for h in [x for x in (e.get("ip4"), e.get("ip6")) if x]:
             try:
-                c = servers.ssh_connect(h, e.get("ssh_port", 22), pw)
+                c = servers.ssh_connect(h, e.get("ssh_port", 22), pw, e.get("ssh_fingerprint"))
                 break
             except Exception as ex:
                 print(f"{h}: {ex}")
         if not c:
             sys.exit("SSH failed")
         servers.host_extras(c, db)
+        with app.LOCK:
+            fresh = app.load_db()
+            fresh["exits"][a[1]]["ssh_fingerprint"] = servers.ssh_trust.fingerprint(c.get_transport().get_remote_server_key())
+            app.save_db(fresh)
         c.close()
     elif a[0] == "geo-update":
         print(app.geo_update(force=True))

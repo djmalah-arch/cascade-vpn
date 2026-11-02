@@ -9,6 +9,8 @@ import hashlib, json, os, random, secrets, subprocess, sys, time, urllib.error, 
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import app  # noqa: E402
+from storage import atomic_write, read_json
+from envfile import set_values
 
 D = app.HOST
 NODE_GW = os.environ.get("NODE_GW", "172.28.0.1")      # docker gateway of remnawave-network (backend -> node)
@@ -16,10 +18,7 @@ AWG_PORT = int(os.environ.get("AWG_PORT", "0")) or random.randint(30000, 60000)
 
 
 def env_set(path, **kv):
-    lines = open(path).read().splitlines() if os.path.exists(path) else []
-    lines = [l for l in lines if l.split("=", 1)[0] not in kv] + [f"{k}={v}" for k, v in kv.items()]
-    open(path, "w").write("\n".join(lines) + "\n")
-    os.chmod(path, 0o600)
+    set_values(path, kv)
 
 
 def api(method, path, body=None, token=None):
@@ -34,7 +33,7 @@ def api(method, path, body=None, token=None):
             raw = r.read()
             return json.loads(raw).get("response") if raw.strip() else None
     except urllib.error.HTTPError as e:
-        raise SystemExit(f"Remnawave {method} {path}: HTTP {e.code} {e.read().decode()[:400]}")
+        raise RuntimeError(f"Remnawave {method} {path}: HTTP {e.code}")
 
 
 def wait_api():
@@ -82,42 +81,67 @@ def initial_msk_profile(k):
 
 
 def provision_remnawave():
-    if os.path.exists(app.STATE):
-        print("state.json exists - Remnawave already provisioned, skipping")
-        return
     wait_api()
     sec = app.env_file(app.SECRETS)
+    if os.path.exists(app.STATE):
+        st = read_json(app.STATE)
+        try:
+            api("GET", "/api/config-profiles", token=sec["RW_TOKEN"])
+            nodes = api("GET", "/api/nodes", token=sec["RW_TOKEN"])
+            if not any(n["uuid"] == st["nodes"]["MSK"] for n in nodes):
+                raise RuntimeError("MSK node missing")
+        except Exception as e:
+            raise RuntimeError("state.json does not match panel database; restore the database before installation") from e
+        print("Remnawave state verified")
+        return
     admin_pw = sec.get("RW_ADMIN_PASS") or secrets.token_urlsafe(18)
     env_set(app.SECRETS, RW_ADMIN_PASS=admin_pw)
-    r = api("POST", "/api/auth/register", {"username": os.environ.get("RW_ADMIN_USER", "geoadmin"), "password": admin_pw})
+    status = api("GET", "/api/auth/status")
+    auth = "register" if status["isRegisterAllowed"] else "login"
+    r = api("POST", f"/api/auth/{auth}", {"username": os.environ.get("RW_ADMIN_USER", "geoadmin"), "password": admin_pw})
     jwt = r["accessToken"]
-    tok = api("POST", "/api/tokens", {"name": "geovpn-portal", "expiresInDays": 3650}, token=jwt)["token"]
-    env_set(app.SECRETS, RW_TOKEN=tok)
+    tok = sec.get("RW_TOKEN")
+    if not tok:
+        tok = api("POST", "/api/tokens", {"name": "geovpn-portal", "expiresInDays": 3650}, token=jwt)["token"]
+        env_set(app.SECRETS, RW_TOKEN=tok)
     rw = lambda m, p, b=None: api(m, p, b, token=tok)
+    journal_path = os.path.join(app.DATA, "bootstrap.json")
+    journal = read_json(journal_path, {})
+    if "keys" not in journal:
+        kp = rw("GET", "/api/system/tools/x25519/generate")["keypairs"][0]
+        journal = {"keys": {"priv": kp["privateKey"], "pub": kp["publicKey"], "sid": secrets.token_hex(8)},
+                   "bridge_uuid": str(uuid.uuid4())}
+        atomic_write(journal_path, json.dumps(journal))
+    k = journal["keys"]
 
-    kp = rw("GET", "/api/system/tools/x25519/generate")["keypairs"][0]
-    k = {"priv": kp["privateKey"], "pub": kp["publicKey"], "sid": secrets.token_hex(8)}
-    prof = rw("POST", "/api/config-profiles", {"name": "MSK", "config": initial_msk_profile(k)})
+    def ensure(path, body, field="name", collection=None):
+        result = rw("GET", path)
+        items = result[collection] if collection else result
+        found = next((x for x in items if x[field] == body[field]), None)
+        return found or rw("POST", path, body)
+
+    prof = ensure("/api/config-profiles", {"name": "MSK", "config": initial_msk_profile(k)}, collection="configProfiles")
     inb = {i["tag"]: i["uuid"] for i in prof["inbounds"]}
-    clients = rw("POST", "/api/internal-squads", {"name": "clients", "inbounds": [inb["MSK_REALITY"], inb["MSK_HY2"]]})
-    bridge = rw("POST", "/api/internal-squads", {"name": "bridge", "inbounds": []})
-    node = rw("POST", "/api/nodes", {"name": "MSK", "address": NODE_GW, "port": 2222, "countryCode": "RU",
+    clients = ensure("/api/internal-squads", {"name": "clients", "inbounds": [inb["MSK_REALITY"], inb["MSK_HY2"]]}, collection="internalSquads")
+    bridge = ensure("/api/internal-squads", {"name": "bridge", "inbounds": []}, collection="internalSquads")
+    node = ensure("/api/nodes", {"name": "MSK", "address": NODE_GW, "port": 2222, "countryCode": "RU",
                                      "configProfile": {"activeConfigProfileUuid": prof["uuid"],
                                                        "activeInbounds": list(inb.values())}})
     secret = rw("GET", "/api/keygen")["secretKey"]
-    open(os.path.join(app.DATA, "node.env"), "w").write(f"NODE_PORT=2222\nSECRET_KEY={secret}\n")
+    atomic_write(os.path.join(app.DATA, "node.env"), f"NODE_PORT=2222\nSECRET_KEY={secret}\n")
     for remark, tag, extra in (("RU MSK Reality", "MSK_REALITY", {"sni": D, "fingerprint": "chrome"}),
                                ("RU MSK Hysteria2", "MSK_HY2", {"sni": D, "alpn": "h3"})):
-        rw("POST", "/api/hosts", {"inbound": {"configProfileUuid": prof["uuid"], "configProfileInboundUuid": inb[tag]},
-                                  "remark": remark, "address": D, "port": 443, **extra})
-    bridge_uuid = str(uuid.uuid4())
-    rw("POST", "/api/users", {"username": "bridge-msk", "vlessUuid": bridge_uuid, "expireAt": "2099-01-01T00:00:00.000Z",
-                              "activeInternalSquads": [bridge["uuid"]]})
+        ensure("/api/hosts", {"inbound": {"configProfileUuid": prof["uuid"], "configProfileInboundUuid": inb[tag]},
+                             "remark": remark, "address": D, "port": 443, **extra}, field="remark")
+    bridge_uuid = journal["bridge_uuid"]
+    service = next((u for u in rw("GET", "/api/users?start=0&size=1000")["users"] if u["username"] == "bridge-msk"), None)
+    if not service:
+        rw("POST", "/api/users", {"username": "bridge-msk", "vlessUuid": bridge_uuid, "expireAt": "2099-01-01T00:00:00.000Z",
+                                  "activeInternalSquads": [bridge["uuid"]]})
     state = {"keys": {"MSK": k}, "bridge_uuid": bridge_uuid,
              "profiles": {"MSK": {"uuid": prof["uuid"], "inbounds": inb}},
              "squads": {"clients": clients["uuid"], "bridge": bridge["uuid"]}, "nodes": {"MSK": node["uuid"]}}
-    json.dump(state, open(app.STATE, "w"), indent=1)
-    os.chmod(app.STATE, 0o600)
+    atomic_write(app.STATE, json.dumps(state, indent=1))
     print("Remnawave provisioned: admin, token, MSK profile/node/hosts, squads, bridge user")
 
 
