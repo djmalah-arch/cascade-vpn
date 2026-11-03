@@ -7,7 +7,7 @@ import secrets
 MSK = dt.timezone(dt.timedelta(hours=3))
 DEFAULT_UPDATES = {"enabled": True, "weekday": 0, "hour": 4, "minute": 0}
 ACTIONS = {"ru": "Из России", "vpn": "Через VPN", "block": "Блокировать"}
-DIRECT_CHECKS = ["ya.ru", "gosuslugi.ru"]
+DIRECT_CHECKS = ["ya.ru", "gosuslugi.ru", "ozon.ru", "avito.ru", "wildberries.ru", "sberbank.ru", "nalog.gov.ru", "pochta.ru"]
 VPN_CHECKS = ["chatgpt.com", "openai.com", "instagram.com", "facebook.com", "x.com", "discord.com",
               "telegram.org", "t.me", "linkedin.com", "medium.com", "bbc.com", "dw.com", "spotify.com",
               "netflix.com", "reddit.com", "github.com", "google.com", "en.wikipedia.org", "cloudflare.com", "speedtest.net"]

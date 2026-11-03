@@ -12,6 +12,9 @@ if [ "$ACT" = up ]; then
   for V in 4 6; do
     if [ $V = 4 ]; then T=iptables; NET=$NET4; LO=127.0.0.1; ANY=0.0.0.0/0; LOC=127.0.0.0/8
     else T=ip6tables; NET=$NET6; LO=::1; ANY=::/0; LOC=::1/128; fi
+    # Install the forward guard before attempting transparent interception.
+    $T -C FORWARD -i awg0 -j DROP 2>/dev/null || $T -I FORWARD -i awg0 -j DROP || exit 1
+    $T -D FORWARD -i awg0 -o awg0 -j DROP 2>/dev/null || true
     ip -$V rule show | grep -q "fwmark 0x1 lookup 100" || ip -$V rule add fwmark 0x1 lookup 100
     ip -$V route replace local $ANY dev lo table 100
     $T -t mangle -N AWG_TP 2>/dev/null || $T -t mangle -F AWG_TP
@@ -28,7 +31,6 @@ if [ "$ACT" = up ]; then
     $T -A AWG_IN -j ACCEPT
     $T -D INPUT -i awg0 -j ACCEPT 2>/dev/null   # older versions accepted everything from awg0
     $T -C INPUT -i awg0 -j AWG_IN 2>/dev/null || $T -I INPUT -i awg0 -j AWG_IN
-    $T -C FORWARD -i awg0 -o awg0 -j DROP 2>/dev/null || $T -I FORWARD -i awg0 -o awg0 -j DROP
   done
   for T in iptables ip6tables; do
     $T -D INPUT -p tcp --dport 2222 -j GEOVPN_NODE 2>/dev/null
@@ -45,6 +47,7 @@ else
     $T -D INPUT -i awg0 -j AWG_IN 2>/dev/null || true
     $T -D INPUT -i awg0 -j ACCEPT 2>/dev/null || true
     $T -D FORWARD -i awg0 -o awg0 -j DROP 2>/dev/null || true
+    $T -D FORWARD -i awg0 -j DROP 2>/dev/null || true
     $T -F AWG_IN 2>/dev/null; $T -X AWG_IN 2>/dev/null
     $T -t mangle -F AWG_TP 2>/dev/null || true
     $T -t mangle -X AWG_TP 2>/dev/null || true

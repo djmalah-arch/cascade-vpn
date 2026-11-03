@@ -207,7 +207,8 @@ def run(log, target="", check_ipv6=True):
                         hs = docker(["exec", client.name, "awg", "show", "awg0", "latest-handshakes"]).stdout
                         if not any(int(line.split()[-1]) > 0 for line in hs.splitlines() if line.split()):
                             raise RuntimeError("нет подтверждённого handshake AmneziaWG")
-                    record.update(evidence, verified=True, domestic=domestic_evidence)
+                    record.update(evidence, verified=domestic_evidence["path"] == "ru" and evidence["path"] == "vpn",
+                                  domestic=domestic_evidence)
                     log(f"{kind} · российский контрольный адрес: IP {domestic_evidence['ip']} ({domestic_evidence['name']}).")
                     where = {"ru": "Из России", "vpn": "Через VPN", "unknown": "Выход не распознан"}[evidence["path"]]
                     log(f"{kind}: {where} · {evidence['name']} · IP {evidence['ip']} · страна по Cloudflare {evidence['country']}.")

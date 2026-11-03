@@ -201,13 +201,22 @@ def check_msk_ip(db):
     """Watchdog: MSK's public IP changed -> push it to all exits' firewalls, remember, warn about DNS."""
     d4, d6 = detect_msk_addrs()
     s4, s6 = msk_addrs(db)
-    if not d4 or (d4 == s4 and (d6 or s6) == s6):
+    if not d4:
         return False
-    res = push_msk_addrs(db, d4, d6)
+    changed = (d4, d6 or s6) != (s4, s6)
+    pending = set(db.get("msk_firewall_pending", [])) & db["exits"].keys()
+    if not changed and not pending:
+        return False
+    targets = db["exits"] if changed else {i: db["exits"][i] for i in pending}
+    res = push_msk_addrs({**db, "exits": targets}, d4, d6 or s6)
+    db["msk_firewall_pending"] = sorted(i for i in targets if not res.get(i))
     db["msk"] = {"v4": d4, "v6": d6 or s6}
     bad = [db["exits"][i]["name"] for i, ok in res.items() if not ok]
-    event(db, f"Сменился IP MSK: {s4} → {d4}. Файрволы выходов обновлены"
-              + (f", кроме: {', '.join(bad)}" if bad else "") + f". Смените A-запись {MSK_DOMAIN} в DNS!")
+    if changed:
+        event(db, f"Сменился IP MSK: {s4} → {d4}. Файрволы выходов обновлены"
+                  + (f", кроме: {', '.join(bad)}" if bad else "") + f". Проверьте A/AAAA {MSK_DOMAIN} в DNS!")
+    elif not bad:
+        event(db, "Повторное обновление файрволов MSK завершено")
     return True
 
 
@@ -512,7 +521,7 @@ def apply(db, plan=None):
         fresh = C.load_db()
         if (fresh.get("_routing_revision", 0) != db.get("_routing_revision", 0)
                 or any(fresh.get(k) != db.get(k) for k in ("exits", "pins", "msk"))):
-            for k in ("exits", "pins", "msk", "balancer"):
+            for k in ("exits", "pins", "msk", "balancer", "routing"):
                 if k in fresh: db[k] = fresh[k]
                 else: db.pop(k, None)
             plan = compute_plan(db)
@@ -659,6 +668,11 @@ def must_switch(db, old, new):
     # plans from before the family pinning: move the primary to IPv6 once
     if "fam" not in old and any(new.get("fam", {}).values()):
         return True
+    fb = old.get("fallback")
+    if fb and new.get("fallback") and (new.get("fallback"), new.get("fb_tag")) != (fb, old.get("fb_tag")):
+        family = "v6" if (old.get("fb_tag") or "").endswith("-6") else "v4"
+        if is_up(new["fallback"]) and (not is_up(fb) or STATUS.get(fb, {}).get(family) is False):
+            return True
     return best_prio(db, new["primary"]) < best_prio(db, old.get("primary"))
 
 
@@ -710,6 +724,7 @@ def watchdog_tick():
             with C.LOCK:
                 fresh = C.load_db()
                 fresh["msk"] = db["msk"]
+                fresh["msk_firewall_pending"] = db["msk_firewall_pending"]
                 C.save_db(fresh)
                 db = fresh
     except Exception as ex:

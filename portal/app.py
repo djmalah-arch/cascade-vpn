@@ -1603,7 +1603,9 @@ def password_role(pw):
 
 
 def session_sig(role, exp):
-    return hmac.new(env_file(PORTAL_ENV)["SESSION_SECRET"].encode(), f"{role}.{exp}".encode(), "sha256").hexdigest()
+    env = env_file(PORTAL_ENV)
+    password_hash = env.get({"a": "SERVERS_PASS", "u": "USERS_PASS"}[role], "")
+    return hmac.new(env["SESSION_SECRET"].encode(), f"{role}.{exp}.{password_hash}".encode(), "sha256").hexdigest()
 
 
 def make_session(role):

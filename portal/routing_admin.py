@@ -44,11 +44,12 @@ def check_summary(db):
                          f'<p class="note">Россия: {C.esc(domestic.get("ip", "—"))} · VPN: {C.esc(result.get("ip", "—"))} · IPv6: {C.esc(result.get("ipv6", {}).get("ip", "не подтверждён"))}</p>')
     table = []
     for r in rows:
-        expected = "Напрямую" if r["expected"] == "ru" else "VPN"
-        route = {"ru": "Напрямую", "vpn": "VPN", "block": "Блокировка"}.get(r.get("path"), "Не подтверждён")
+        expected = "Из России (MSK)" if r["expected"] == "ru" else "VPN"
+        route = {"ru": "Из России (MSK)", "vpn": "VPN", "block": "Блокировка"}.get(r.get("path"), "Не подтверждён")
         code = r.get("http", 0)
-        http = str(code) if code else "нет ответа"
-        if code >= 400: http += " · ограничение сайта"
+        label = {401: "нужен вход", 403: "отказ в доступе", 404: "страница не найдена", 405: "HEAD не поддержан", 429: "ограничение запросов"}.get(code)
+        if 500 <= code < 600: label = "ошибка сайта или шлюза"
+        http = (str(code) + (" · " + label if label else "")) if code else "нет ответа HTTPS"
         table.append(f'<tr><td>{C.esc(r["host"])}</td><td>{expected}</td><td><span class="pill {"on" if r.get("matches") else "warnp"}">{route}</span></td><td>{http}</td></tr>')
     checked = C.ago(C.parse_ts(record.get("ts")))
     detail = ''.join(protocols) + f'<p class="note">Последняя проверка: {checked}. Контрольные адреса проверяются всеми тремя протоколами. Сайты — реальными запросами через Reality с подтверждением outbound в журнале.</p>'

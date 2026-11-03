@@ -203,7 +203,7 @@ def set_password(which, pw):
     for path, k, v in ((app.PORTAL_ENV, key, f"{salt}${h}"), (app.SECRETS, plain, pw)):
         with app.LOCK:
             set_values(path, {k: v})
-    print(f"password for '{which}' changed (open sessions stay valid up to 12 h)")
+    print(f"password for '{which}' changed; previous sessions revoked")
 
 
 def main():

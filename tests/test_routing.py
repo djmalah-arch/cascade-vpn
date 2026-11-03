@@ -26,11 +26,11 @@ class RoutingTests(unittest.TestCase):
         self.assertEqual(client[-1]["port"], "19000-20999")
         with self.assertRaises(ValueError): policy.new_rule("Bad", "ru", "udp:99999")
 
-    def test_monitor_defaults_are_two_direct_and_twenty_vpn_sites(self):
+    def test_monitor_defaults_include_domestic_services_and_twenty_vpn_sites(self):
         settings = policy.checks({})
-        self.assertEqual(len(settings["direct"]), 2)
+        self.assertTrue({"ozon.ru", "avito.ru", "gosuslugi.ru"} <= set(settings["direct"]))
         self.assertEqual(len(settings["vpn"]), 20)
-        self.assertEqual(len(set(settings["direct"] + settings["vpn"])), 22)
+        self.assertFalse(set(settings["direct"]) & set(settings["vpn"]))
 
     def test_domains_networks_ranges_and_clusters(self):
         r = policy.new_rule("Офис", "ru", "пример.рф\n10.2.3.9/24\n203.0.113.4-203.0.113.7\n2001:db8::/32")
