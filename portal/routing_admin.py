@@ -32,8 +32,9 @@ def check_summary(db):
     record = db.get("routing_check", {})
     rows = record.get("websites", [])
     confirmed = sum(r.get("verified") and r.get("matches") for r in rows)
-    accessible = sum(200 <= r.get("http", 0) < 400 for r in rows)
-    text = f"Маршрут {confirmed}/{len(rows)} · доступны {accessible}/{len(rows)}" if rows else "Ещё не проверено"
+    successful = sum(200 <= r.get("http", 0) < 300 for r in rows)
+    redirected = sum(300 <= r.get("http", 0) < 400 for r in rows)
+    text = f"Маршрут {confirmed}/{len(rows)} · HTTPS 2xx: {successful} · перенаправления: {redirected}" if rows else "Ещё не проверено"
     if record.get("stale") or (rows and record.get("revision") != db.get("_routing_revision", 0)):
         text = "Правила изменились — нужна новая проверка"
     protocols = []
@@ -48,11 +49,12 @@ def check_summary(db):
         route = {"ru": "Из России (MSK)", "vpn": "VPN", "block": "Блокировка"}.get(r.get("path"), "Не подтверждён")
         code = r.get("http", 0)
         label = {401: "нужен вход", 403: "отказ в доступе", 404: "страница не найдена", 405: "HEAD не поддержан", 429: "ограничение запросов"}.get(code)
+        if 300 <= code < 400: label = "перенаправление"
         if 500 <= code < 600: label = "ошибка сайта или шлюза"
         http = (str(code) + (" · " + label if label else "")) if code else "нет ответа HTTPS"
         table.append(f'<tr><td>{C.esc(r["host"])}</td><td>{expected}</td><td><span class="pill {"on" if r.get("matches") else "warnp"}">{route}</span></td><td>{http}</td></tr>')
     checked = C.ago(C.parse_ts(record.get("ts")))
-    detail = ''.join(protocols) + f'<p class="note">Последняя проверка: {checked}. Контрольные адреса проверяются всеми тремя протоколами. Сайты — реальными запросами через Reality с подтверждением outbound в журнале.</p>'
+    detail = ''.join(protocols) + f'<p class="note">Последняя проверка: {checked}. Контрольные адреса проверяются всеми тремя протоколами. Сайты проверяются запросом HEAD через Reality с подтверждением outbound в журнале. Код относится к первому ответу, перенаправления не выполняются.</p>'
     if table:
         detail += '<div class="scroll"><table><thead><tr><th>Сайт</th><th>Ожидание</th><th>Фактически</th><th>HTTPS</th></tr></thead><tbody>' + ''.join(table) + '</tbody></table></div>'
     return text, detail
@@ -105,9 +107,9 @@ def render(query):
 <div class="sub">Правила трафика, проверка подключений и обновление списков</div>
 {f'<div class="card ok">{C.esc(message)}</div>' if message else ''}
 <div class="card"><h2>Куда направлять трафик</h2><p>По умолчанию российские сайты идут из России, YouTube — через российский сервер, остальное — через зарубежный VPN.</p>
-<button class="btn" onclick="editRule()">+ Добавить правило</button><details><summary>Как применяются правила</summary><p class="hint">«Из России» в ваших правилах означает IP входного сервера. В Happ обычные российские сайты могут открываться напрямую с устройства. Hiddify с региональными правилами тоже может отправлять трафик мимо сервера — сервер не может изменить такой маршрут.</p></details>{pending}</div>
+<button class="btn" onclick="editRule()">+ Добавить правило</button><details><summary>Как применяются правила</summary><p class="hint">Базовый маршрут из России включает категорию российских сайтов (geosite:category-ru) и российские IP (geoip:ru). Список наблюдения ниже проверяет отдельные сайты этой политики. «Из России» в новых правилах означает IP входного сервера. В Happ и Hiddify клиентские правила могут направлять часть трафика прямо с устройства.</p></details>{pending}</div>
 <details class="card"><summary>Свои правила · {len(rules)} <span class="mut">редактирование и удаление</span></summary><p class="hint">Исключения из direct.json перенесены сюда. Удаление возвращает стандартный маршрут. Чтобы принудительно направить сайт через VPN, измените направление правила.</p><div class="route-list">{''.join(cards) or '<p class="mut">Своих правил пока нет.</p>'}</div></details>
-<details class="card"><summary>Состояние трафика · <span id="check-summary">{check_text}</span></summary><div id="routing-health">{check_detail}</div><h2 style="margin-top:18px">Проверить сейчас</h2><p class="hint">Проверим 2 прямых и 20 VPN-сайтов, а также три протокола и IPv6. Обычно это занимает 1–3 минуты.</p>
+<details class="card"><summary>Состояние трафика · <span id="check-summary">{check_text}</span></summary><div id="routing-health">{check_detail}</div><h2 style="margin-top:18px">Проверить сейчас</h2><p class="hint">Проверим сайты из списка наблюдения (Россия: {len(check_cfg['direct'])}, VPN: {len(check_cfg['vpn'])}), три протокола и IPv6. Обычно это занимает 1–3 минуты.</p>
 <form method="post" action="/admin/routing/check"><label>Сайт или IP <input name="target" placeholder="example.com — необязательно"></label><button class="btn">Проверить три протокола</button></form>
 <p class="hint">Проверка с сервера подтверждает протокол и серверные правила. Настройки маршрутизации на личном устройстве проверяются отдельно.</p>
 <p id="check-progress" class="note">{C.esc('Выполняется…' if job else '')}</p><details><summary>Журнал проверки</summary><pre id="check-result" style="white-space:pre-wrap">{C.esc('Ожидание результата…' if job else 'Журнал появится после запуска проверки.')}</pre></details>
