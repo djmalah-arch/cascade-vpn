@@ -84,7 +84,7 @@ docker exec geovpn-portal geovpn set-password admin 'NEW'  # пароль адм
 docker exec geovpn-portal geovpn apply-direct              # применить data/portal/direct.json (игры мимо VPN)
 docker exec geovpn-portal geovpn backup                    # бэкап сейчас (ежедневно сам, + копия на выход с наименьшим приоритетом)
 docker compose logs -f portal                              # лог портала
-git pull && docker compose build && docker compose up -d   # обновление
+git pull && SOURCE_COMMIT=$(git rev-parse HEAD) docker compose build && docker compose up -d   # обновление
 ```
 
 ## Маршрутизация и проверка трафика

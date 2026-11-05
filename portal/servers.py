@@ -153,7 +153,7 @@ if ! head -c 536870913 > "$part" || [ ! -s "$part" ] || [ "$(stat -c %s "$part")
 actual=$(sha256sum "$part" | cut -d' ' -f1)
 if [ -n "$expected" ] && [ "$actual" != "$expected" ]; then rm -f "$part"; echo checksum-failed; exit 1; fi
 mv "$part" "$d/$n"; chmod 600 "$d/$n"
-ls -1t $d/msk-*.tar.gz | tail -n +31 | xargs -r rm -f
+ls -1t $d/msk-*.tar.gz* | tail -n +31 | xargs -r rm -f
 echo "ok $actual"
 X
 chmod 755 /usr/local/sbin/geovpn-backup-recv
@@ -515,35 +515,45 @@ def validate_profile(config):
 
 
 def apply(db, plan=None):
-    """Push MSK profile (+ node inbounds) and bridge squad to Remnawave."""
-    # Same lock order everywhere. Never apply a snapshot read before a slow network probe.
-    with C.LOCK, APPLY_LOCK:
-        fresh = C.load_db()
-        if (fresh.get("_routing_revision", 0) != db.get("_routing_revision", 0)
-                or any(fresh.get(k) != db.get(k) for k in ("exits", "pins", "msk"))):
-            for k in ("exits", "pins", "msk", "balancer", "routing"):
-                if k in fresh: db[k] = fresh[k]
-                else: db.pop(k, None)
-            plan = compute_plan(db)
-            db["_routing_revision"] = fresh.get("_routing_revision", 0)
-        st = state()
-        plan = plan or db["balancer"].get("plan") or compute_plan(db)
-        config = msk_profile(db, plan)
-        validate_profile(config)
-        prof = C.rw("PATCH", "/api/config-profiles", {"uuid": st["profiles"]["MSK"]["uuid"], "config": config})
-        C.rw("PATCH", "/api/nodes", {"uuid": st["nodes"]["MSK"], "configProfile": {
-            "activeConfigProfileUuid": st["profiles"]["MSK"]["uuid"], "activeInbounds": [i["uuid"] for i in prof["inbounds"]]}})
-        inbounds = []
-        for eid, e in exits_sorted(db):
-            if e.get("profile_uuid"):
-                p = C.rw("GET", f"/api/config-profiles/{e['profile_uuid']}")
-                inbounds += [i["uuid"] for i in p.get("inbounds", [])]
-        C.rw("PATCH", "/api/internal-squads", {"uuid": st["squads"]["bridge"], "inbounds": inbounds})
-        db["balancer"]["plan"] = plan
-        fresh = C.load_db()
-        fresh.setdefault("balancer", {}).update(db["balancer"])
-        C.save_db(fresh)
-        keep_enabled(st["nodes"]["MSK"])
+    """Serialize remote profile writers without blocking readers of local state during network I/O."""
+    with APPLY_LOCK:
+        for attempt in range(3):
+            with C.LOCK:
+                fresh = C.load_db()
+                if (fresh.get("_routing_revision", 0) != db.get("_routing_revision", 0)
+                        or any(fresh.get(k) != db.get(k) for k in ("exits", "pins", "msk"))):
+                    for key in ("exits", "pins", "msk", "balancer", "routing"):
+                        if key in fresh: db[key] = fresh[key]
+                        else: db.pop(key, None)
+                    plan = None
+                    db["_routing_revision"] = fresh.get("_routing_revision", 0)
+                revision = fresh.get("_routing_revision", 0)
+            st = state()
+            current_plan = plan or db["balancer"].get("plan") or compute_plan(db)
+            config = msk_profile(db, current_plan)
+            validate_profile(config)
+            with C.LOCK:
+                if C.load_db().get("_routing_revision", 0) != revision: continue
+            prof = C.rw("PATCH", "/api/config-profiles", {"uuid": st["profiles"]["MSK"]["uuid"], "config": config})
+            C.rw("PATCH", "/api/nodes", {"uuid": st["nodes"]["MSK"], "configProfile": {
+                "activeConfigProfileUuid": st["profiles"]["MSK"]["uuid"], "activeInbounds": [i["uuid"] for i in prof["inbounds"]]}})
+            inbounds = []
+            for eid, exit in exits_sorted(db):
+                if exit.get("profile_uuid"):
+                    profile = C.rw("GET", f"/api/config-profiles/{exit['profile_uuid']}")
+                    inbounds += [i["uuid"] for i in profile.get("inbounds", [])]
+            C.rw("PATCH", "/api/internal-squads", {"uuid": st["squads"]["bridge"], "inbounds": inbounds})
+            keep_enabled(st["nodes"]["MSK"])
+            with C.LOCK:
+                fresh = C.load_db()
+                if fresh.get("_routing_revision", 0) != revision:
+                    plan = None
+                    continue
+                fresh.setdefault("balancer", {}).update({"plan": current_plan, "degraded": False})
+                C.save_db(fresh)
+                db["balancer"]["plan"] = current_plan
+                return
+        raise RuntimeError("Routing changed during apply; current revision will be retried")
 
 
 def keep_enabled(node_uuid, wait=8):

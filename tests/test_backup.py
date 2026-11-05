@@ -14,6 +14,7 @@ class BackupTests(unittest.TestCase):
     def test_offsite_receiver_accepts_old_and_unique_new_backup_names(self):
         self.assertRegex("msk-20261102-1234.tar.gz", backups.BACKUP_NAME_RE)
         self.assertRegex("msk-20261102-123456-123456.tar.gz", backups.BACKUP_NAME_RE)
+        self.assertRegex("msk-20261102-123456-123456.tar.gz.enc", backups.BACKUP_NAME_RE)
         self.assertIsNone(re.fullmatch(backups.BACKUP_NAME_RE, "../../escape.tar.gz"))
     def test_round_trip_preserves_project_layout_and_database(self):
         with tempfile.TemporaryDirectory() as d:
@@ -26,7 +27,9 @@ class BackupTests(unittest.TestCase):
             old = data / "portal/backups/old.tar.gz"; old.parent.mkdir(); old.write_bytes(b"old")
             dump = root / "database.dump"; dump.write_bytes(b"PGDMP-test")
             archive = root / "backup.tar.gz"
-            backups.create(data, dump, archive)
+            backups.create(data, dump, archive, {'commit':'a'*40,'state_schema':2,'images':{'portal':'sha256:test'}})
+            with tarfile.open(archive) as tf:
+                self.assertEqual(json.load(tf.extractfile('manifest.json'))['provenance']['commit'], 'a'*40)
             restored = root / "restored"
             backups.restore(archive, restored)
             for name, text in files.items(): self.assertEqual((restored / name).read_text(), text)

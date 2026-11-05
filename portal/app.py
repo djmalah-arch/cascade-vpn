@@ -14,6 +14,11 @@ import segno
 from storage import ProcessLock, atomic_write, read_json
 import public_state
 import routing_policy
+import processes
+import health
+import state_schema
+from auth_limits import LoginLimits
+LOGIN_LIMITS = LoginLimits()
 
 sys.modules.setdefault("app", sys.modules[__name__])
 
@@ -90,7 +95,9 @@ MTP_CONF = os.environ.get("MTP_CONF", "/etc/geovpn/mtproxy/config.py")
 MTP_METRICS = "http://127.0.0.1:9189/"
 
 LOCK = ProcessLock(lambda: DB_PATH + ".lock")
+USER_OP_LOCK = ProcessLock(lambda: DB_PATH + ".users.lock")
 MEMORY_LOCK = threading.RLock()
+USERS_LOCK = threading.RLock()
 STARTED = time.time()
 STARTUP_GRACE = 180  # s after portal start: services are still coming up, don't log health alerts
 CACHE = {"users": ([], 0.0), "mon": ({}, 0.0)}
@@ -140,12 +147,7 @@ def gb(b):
 
 
 def sh(cmd, timeout=20):
-    try:
-        r = subprocess.run(cmd, shell=isinstance(cmd, str), capture_output=True, text=True, timeout=timeout,
-                           executable="/bin/bash" if isinstance(cmd, str) else None)
-        return r.returncode, r.stdout.strip()
-    except subprocess.TimeoutExpired:
-        return 124, ""
+    return processes.run(cmd, timeout)
 
 
 TR = dict(zip("абвгдеёжзийклмнопрстуфхцчшщъыьэюя",
@@ -162,14 +164,14 @@ def slugify(name):
 SERVICES = ({"AmneziaWG": "geovpn-awg", "мост AWG→xray": "geovpn-singbox", "zapret": "geovpn-zapret",
              "страницы подключения": "geovpn-public",
              "MTProxy": "geovpn-mtproxy", "Caddy": "geovpn-caddy", "нода xray": "remnanode",
-             "панель": "remnawave", "БД панели": "remnawave-db"} if DATA else
+             "панель": "remnawave", "БД панели": "remnawave-db", "Valkey": "remnawave-redis"} if DATA else
             {"awg-quick@awg0": "awg-quick@awg0", "sing-box": "sing-box", "zapret": "zapret",
              "geovpn-mtproxy": "geovpn-mtproxy", "geovpn-fw": "geovpn-fw", "docker": "docker"})
 
 
 def svc_active(name):
     if DATA:
-        return sh(["docker", "inspect", "-f", "{{.State.Running}}", name])[1] == "true"
+        return sh(["docker", "inspect", "-f", "{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Running}}{{end}}", name])[1] in ("true", "healthy")
     return sh(["systemctl", "is-active", name])[1] == "active"
 
 
@@ -187,12 +189,16 @@ def load_db():
     if PUBLIC:
         return {"users": public_state.read(PUBLIC_STATE)["users"]}
     with LOCK:
-        return read_json(DB_PATH, {"users": {}})
+        db = read_json(DB_PATH, {"users": {}})
+        if state_schema.migrate(db):
+            atomic_write(DB_PATH, json.dumps(db, ensure_ascii=False, indent=1))
+        return db
 
 
 def save_db(db):
     if PUBLIC: raise RuntimeError("Public worker cannot write control state")
     with LOCK:
+        state_schema.migrate(db)
         previous = read_json(DB_PATH, {"users": {}})
         changed = any(previous.get(k) != db.get(k) for k in ("exits", "pins", "msk")) or (
             previous.get("routing", {}).get("rules") != db.get("routing", {}).get("rules"))
@@ -202,6 +208,14 @@ def save_db(db):
         if changed and "balancer" in db: db["balancer"]["plan"] = None
         atomic_write(DB_PATH, json.dumps(db, ensure_ascii=False, indent=1))
         publish_connections(db)
+
+
+def save_users(db):
+    """User operations own only users; do not overwrite routing changed during remote I/O."""
+    with LOCK:
+        fresh = load_db()
+        fresh["users"] = db["users"]
+        save_db(fresh)
 
 
 def publish_connections(db):
@@ -265,7 +279,7 @@ def rw(method, path, body=None):
 
 def rw_users(force=False):
     if PUBLIC: return public_state.read(PUBLIC_STATE)["remote"]
-    with LOCK:
+    with USERS_LOCK:
         users, ts = CACHE["users"]
         if force or time.time() - ts > 20:
             users, start = [], 0
@@ -490,7 +504,7 @@ def create_user(name, group=MOD_GROUP, operation_id=None, diagnostic=False):
     name = " ".join(name.split())[:60]
     if len(name) < 2:
         raise UserError("Укажите имя пользователя")
-    with LOCK:
+    with USER_OP_LOCK:
         db = load_db()
         if operation_id:
             previous = next((s for s, u in db["users"].items() if u.get("create_operation") == operation_id), None)
@@ -511,7 +525,7 @@ def create_user(name, group=MOD_GROUP, operation_id=None, diagnostic=False):
                              "create_operation": operation_id or secrets.token_hex(16),
                              "vless_uuid": str(__import__("uuid").uuid4()), "diagnostic": diagnostic,
                              "expires": (now_utc() + dt.timedelta(minutes=30) if diagnostic else now_utc() + dt.timedelta(days=VALID_DAYS)).strftime("%Y-%m-%dT%H:%M:%S.000Z")}
-        save_db(db)
+        save_users(db)
         complete_user_create(db, slug)
         rw_users(force=True)
         publish_connections(db)
@@ -533,7 +547,7 @@ def complete_user_create(db, slug):
     u["rw_id"] = remote["id"]
     u.pop("pending_create", None)
     if not u.get("pending_action"): u.pop("blocked", None)
-    save_db(db)
+    save_users(db)
 
 
 def finish_user_action(db, slug):
@@ -545,9 +559,8 @@ def finish_user_action(db, slug):
         rw("POST", f"/api/users/{uid}/actions/{action}", {})
         u["blocked"] = action == "disable"
     elif action == "reissue":
-        rw("POST", f"/api/users/{uid}/actions/revoke", {})
-        u.update(u.pop("replacement"))
-        u.pop("blocked", None)
+        import user_operations
+        user_operations.reissue(db, slug, rw, save_users)
     elif action == "delete":
         try:
             rw("DELETE", f"/api/users/{uid}")
@@ -555,11 +568,11 @@ def finish_user_action(db, slug):
             if "HTTP 404" not in str(e): raise
         del db["users"][slug]
     u.pop("pending_action", None)
-    save_db(db)
+    save_users(db)
 
 
 def user_action(slug, action, role="a", group=None):
-    with LOCK:
+    with USER_OP_LOCK:
         db = load_db()
         u = db["users"].get(slug)
         if not u:
@@ -570,7 +583,7 @@ def user_action(slug, action, role="a", group=None):
             if role != "a":
                 raise UserError("Переносить пользователей между группами может только администратор")
             u["group"] = valid_group(group)
-            save_db(db)
+            save_users(db)
             return
         uid = u["rw_id"]
         if action == "extend":
@@ -588,7 +601,7 @@ def user_action(slug, action, role="a", group=None):
                 u["replacement"] = {"awg": awg_new_peer(db), "mt": secrets.token_hex(16), "page": new_page_id(slug)}
             u["blocked"] = True
             u["pending_action"] = action
-            save_db(db)
+            save_users(db)
             # Local protocols are reconciled even when the remote panel is unavailable.
             failures = []
             try:
@@ -606,13 +619,13 @@ def user_action(slug, action, role="a", group=None):
             return
         else:
             raise RuntimeError("Неизвестное действие")
-        save_db(db)
+        save_users(db)
         rw_users(force=True)
         awg_apply(db)
 
 
 def import_existing():
-    with LOCK:
+    with USER_OP_LOCK:
         try:
             _import_existing()
         finally:
@@ -624,12 +637,12 @@ def import_existing():
 
 def _import_existing():
     """Adopt Remnawave users created outside the portal (e.g. test-admin)."""
-    with LOCK:
+    with USER_OP_LOCK:
         db = load_db()
         for slug in list(db["users"]):
             u = db["users"][slug]
             if u.get("diagnostic") and (now_utc() - parse_ts(u["created"])).total_seconds() > 1800:
-                u["blocked"] = True; u["pending_action"] = "delete"; save_db(db)
+                u["blocked"] = True; u["pending_action"] = "delete"; save_users(db)
             try:
                 if u.get("pending_create"): complete_user_create(db, slug)
                 if u.get("pending_action"): finish_user_action(db, slug)
@@ -664,7 +677,7 @@ def _import_existing():
             del db["users"][slug]
             changed = True
         if changed:
-            save_db(db)
+            save_users(db)
         publish_connections(db)
 
 
@@ -702,6 +715,11 @@ def collect_monitoring():
     except OSError:
         m["backup"] = None
     m["offsite"] = load_db().get("backup_offsite")
+    m["tasks"] = health.failures() if DATA else []
+    if DATA:
+        import awg_profile
+        m['awg_compatibility'] = awg_profile.inspect(awg_params())
+        m['awg_compatibility']['tools_version'] = sh(['awg', '--version'])[1]
     return m
 
 
@@ -730,7 +748,7 @@ def heartbeat():
                                    "https://www.youtube.com/generate_204"])[0] == 0:
         sh(["curl", "-fsS", "-m", "15", f"https://hc-ping.com/{hc['HC_YOUTUBE']}"])
     if hc.get("HC_ALIVE"):
-        bad = [k for k, v in SERVICES.items() if not svc_active(v)]
+        bad = [k for k, v in SERVICES.items() if not svc_active(v)] + health.failures()
         url = f"https://hc-ping.com/{hc['HC_ALIVE']}" + ("/fail" if bad else "")
         if sh(["curl", "-fsS", "-m", "15", "--data-raw", ", ".join(bad) or "ok", url])[0] != 0:
             sh(["curl", "-fsS", "-m", "15", "--socks5-hostname", "127.0.0.1:10808", "--data-raw", ", ".join(bad) or "ok", url])
@@ -752,8 +770,20 @@ def backup():
                 r = subprocess.run(["docker", "exec", "remnawave-db", "pg_dump", "-U", "postgres", "-d", "postgres", "-Fc"],
                                    stdout=f, stderr=subprocess.PIPE, timeout=600)
             if r.returncode: raise RuntimeError("pg_dump failed")
-            backups.create(source, dump, out)
-    for f in sorted(x for x in os.listdir(BACKUP_DIR) if x.startswith("msk-") and x.endswith(".tar.gz"))[:-14]:
+            release = read_json('/app/release.json', {})
+            if not release.get('commit'): raise RuntimeError('Missing build provenance; backup refused')
+            release['state_schema'] = state_schema.VERSION
+            rc, image_rows = sh(['docker', 'inspect', '--format', '{{.Name}} {{.Image}}',
+                                 *sorted(set(SERVICES.values()) | {'geovpn-portal'})])
+            if rc: raise RuntimeError('Cannot record deployed image versions')
+            release['images'] = {row.split()[0].lstrip('/'): row.split()[1] for row in image_rows.splitlines()}
+            backups.create(source, dump, out, release)
+            certificate = P('backup-recipient.pem', '/etc/geovpn/backup-recipient.pem')
+            if not os.path.isfile(certificate): raise RuntimeError('Backup recovery certificate is not configured')
+            encrypted = backups.encrypt(out, certificate)
+            os.unlink(out)
+            out = encrypted
+    for f in sorted(x for x in os.listdir(BACKUP_DIR) if x.startswith("msk-") and x.endswith((".tar.gz", ".tar.gz.enc")))[:-14]:
         os.remove(os.path.join(BACKUP_DIR, f))
     return backup_offsite(out)
 
@@ -946,59 +976,6 @@ def geo_restore():
         print("geo lists restored in the node:", ", ".join(files), flush=True)
 
 
-def scheduler():
-    """Docker mode only: heartbeat every minute, backup daily ~03:30 MSK, installers weekly."""
-    last = {"backup": None, "apps": 0, "geo": None, "geo_check": 0, "audit": 0}
-    while True:
-        try:
-            heartbeat()
-        except Exception as e:
-            log_error(f"Пульс мониторинга: {e!r}")
-        msk = dt.datetime.now(dt.timezone(dt.timedelta(hours=3)))
-        done = load_db().get("schedule", {})
-        if (msk.hour, msk.minute) >= (3, 30) and done.get("backup") != str(msk.date()) and time.time() - last.get("backup_retry", 0) >= 300:
-            last["backup_retry"] = time.time()
-            try:
-                backup()
-                with LOCK:
-                    db = load_db(); db.setdefault("schedule", {})["backup"] = str(msk.date()); save_db(db)
-            except Exception as e:
-                log_error(f"Бэкап не сделан: {e}")
-        db = load_db()
-        config = routing_policy.updates(db)
-        due = routing_policy.last_due(config, msk)
-        checked = parse_ts(db.get("geo_update", {}).get("checked"))
-        if not checked:
-            dates = [os.path.getmtime(os.path.join(GEO_DIR, n)) for n in GEO_MUST if os.path.isfile(os.path.join(GEO_DIR, n))]
-            if dates: checked = dt.datetime.fromtimestamp(max(dates), dt.timezone.utc)
-        if config["enabled"] and (not checked or checked < due) and time.time() - last.get("geo_retry", 0) >= 300:
-            last["geo_retry"] = time.time()
-            try:
-                print(geo_update(), flush=True)
-            except Exception as e:
-                log_error(f"Обновление geoip/geosite: {e}")
-        elif time.time() - last["geo_check"] > 3600 and time.time() - STARTED > STARTUP_GRACE:
-            last["geo_check"] = time.time()
-            try:
-                geo_restore()
-            except Exception as e:
-                log_error(f"Возврат свежих geoip/geosite в ноду: {e}")
-        if time.time() - last["audit"] > 600 and time.time() - STARTED > STARTUP_GRACE:
-            last["audit"] = time.time()
-            try:
-                routing_audit()
-            except Exception as e:
-                print("routing audit:", repr(e), flush=True)     # diagnostics only: not worth an alarm
-        if time.time() - last["apps"] > 7 * 86400:
-            rc, out = sh(["bash", "/app/scripts/apps-update.sh"], timeout=3600)
-            if rc != 0:
-                log_error("Обновление установщиков приложений: " + out[-300:])
-                last["apps"] = time.time() - 7 * 86400 + 300
-            else:
-                last["apps"] = time.time()
-        time.sleep(60)
-
-
 def ensure_awg_routing():
     """AmneziaWG -> TPROXY needs 'ip rule fwmark 0x1 lookup 100' + a local route in table 100.
     systemd-networkd (restarted by package upgrades) flushes such "foreign" rules -> clients connect, no traffic.
@@ -1022,34 +999,17 @@ def ensure_awg_routing():
 
 
 def background():
-    while True:
-        try:
-            ensure_awg_routing()
-        except Exception as e:
-            log_error(f"Проверка маршрутизации AmneziaWG: {e!r}")
-        try:
-            import_existing()
-            mon = collect_monitoring()
-            with LOCK:
-                CACHE["mon"] = (mon, time.time())
-            bad = [k for k, v in mon["services"].items() if v != "active"] + \
-                  [f"docker:{k}" for k, v in mon["containers"].items() if not v]
-            warm = time.time() - STARTED > STARTUP_GRACE
-            if bad and warm:
-                log_error("Службы MSK не работают: " + ", ".join(bad))
-            if not mon.get("youtube") and warm:
-                log_error("YouTube с MSK недоступен (проверь IPv6 и zapret, ADMIN.md 6.4)")
-        except Exception as e:
-            if time.time() - STARTED > STARTUP_GRACE:
-                log_error(f"Фоновая задача портала: {e!r}")
-            else:
-                print("background (startup, not logged):", repr(e), flush=True)
-        try:
-            import diagnostics
-            diagnostics.tick()
-        except Exception as e:
-            print("routing checks:", type(e).__name__, flush=True)
-        time.sleep(60)
+    ensure_awg_routing()
+    import_existing()
+    mon = collect_monitoring()
+    with LOCK:
+        CACHE["mon"] = (mon, time.time())
+    bad = [k for k, v in mon["services"].items() if v != "active"]
+    if time.time() - STARTED > STARTUP_GRACE:
+        if bad: log_error("?????? MSK ?? ????????: " + ", ".join(bad))
+        if not mon.get("youtube"): log_error("YouTube ? MSK ??????????")
+    import diagnostics
+    diagnostics.tick()
 
 
 # ---------------------------------------------------------------- HTML
@@ -1140,7 +1100,11 @@ def qr_svg(data, err="m"):
 
 def apps():
     try:
-        return json.load(open(os.path.join(APP_DIR, "apps.json")))
+        with open(os.path.join(APP_DIR, "apps.json")) as stream:
+            manifest = json.load(stream)
+        manifest['sizes'] = {name: size for name, size in manifest.get('sizes', {}).items()
+                             if name in manifest.get('verified', {})}
+        return manifest
     except (OSError, ValueError):
         return {"versions": {}, "sizes": {}}
 
@@ -1178,6 +1142,10 @@ def render_admin(msg=None, err=None, hl=None, role="u", gfilter=None, live=False
     svc = "".join(f'<div class="kv"><span>{esc(k)}</span><span>{pill(v == "active", v, v or "нет")}</span></div>'
                   for k, v in m["services"].items())
     svc += "".join(f'<div class="kv"><span>docker: {esc(k)}</span><span>{pill(v)}</span></div>' for k, v in m["containers"].items())
+    svc += ''.join(f'<div class="kv"><span>Фоновая задача: {esc(name)}</span>{pill(False)}</div>' for name in m.get('tasks', []))
+    if m.get('awg_compatibility'):
+        compat = m['awg_compatibility']
+        svc += f'<p class="note">AWG-профиль {esc(compat["wire_profile"])} · {esc(compat.get("tools_version", ""))}</p>'
     h = m["host"]
     bk = m.get("backup")
     host = (f'<div class="kv"><span>Нагрузка</span><span>{esc(h["load"])}</span></div>'
@@ -1433,13 +1401,13 @@ function showQr(btn) { btn.closest('.step').classList.add('qr-shown'); btn.hidde
 """
 
 
-def dl(fname, label, os_=None):
+def dl(fname, label, os_=None, access=None):
     a = apps()
     size = a["sizes"].get(fname)
     version = a.get("file_versions", {}).get(fname, "")
-    if not size:
+    if not size or not access:
         return f'<span class="btn alt download-pending" aria-disabled="true">{esc(label)}<span class="sz">файл готовится</span></span>'
-    return (f'<a class="btn alt" href="/app/{fname}"{f" data-os={chr(34)}{os_}{chr(34)}" if os_ else ""}>{esc(label)}'
+    return (f'<a class="btn alt" href="/app/{fname}?access={quote(access)}"{f" data-os={chr(34)}{os_}{chr(34)}" if os_ else ""}>{esc(label)}'
             f'<span class="sz">{esc(version)} · {size / 1e6:.0f} МБ</span></a>')
 
 
@@ -1475,6 +1443,7 @@ def option(oid, icon, color, title, badges, desc, plat, body):
 
 
 def render_user(u, client_ip):
+    download = lambda name, label, os_=None: dl(name, label, os_, access=u["page"])
     r = rw_user_by_id(u["rw_id"])
     name = u["name"]
     head = f'<div class="wrap narrow"><h1>{esc(BRAND)}</h1><div class="sub">Персональная страница подключения — {esc(name)}</div>'
@@ -1495,8 +1464,8 @@ def render_user(u, client_ip):
         "Основной вариант. Российские сайты (банки, Госуслуги, Avito) открываются напрямую, остальное — через VPN. Ничего настраивать не нужно: правила приходят с сервера и обновляются сами.",
         "Windows · Android · Mac · iPhone и iPad",
         step(1, "Установите приложение",
-             f'<div class="dls">{dl("Happ-windows.exe", "Windows", "windows")}{dl("Happ-android.apk", "Android", "android")}'
-             f'{dl("Happ-macos.dmg", "Mac", "mac")}{store("https://apps.apple.com/us/app/happ-proxy-utility/id6504287215", "iPhone / iPad — App Store")}</div>'
+             f'<div class="dls">{download("Happ-windows.exe", "Windows", "windows")}{download("Happ-android.apk", "Android", "android")}'
+             f'{download("Happ-macos.dmg", "Mac", "mac")}{store("https://apps.apple.com/us/app/happ-proxy-utility/id6504287215", "iPhone / iPad — App Store")}</div>'
              f'<p class="note">Выделена кнопка для <span class="os-name"></span>. Версия указана у файла для вашей платформы.</p>{android_note}')
         + step(2, "Добавьте подключение",
              connect_block(sub, "m", "happ-uri", sub, f'<a class="btn" href="happ://add/{esc(sub)}">Открыть в Happ</a>',
@@ -1512,8 +1481,8 @@ def render_user(u, client_ip):
         "Если Happ не подходит. Сам выбирает самый быстрый способ подключения. Нужно один раз настроить регион и DNS (шаг 3), иначе российские сайты пойдут через VPN и некоторые (Avito, банки) не откроются.",
         "Windows · Android · Mac · iPhone и iPad",
         step(1, "Установите приложение",
-             f'<div class="dls">{dl("Hiddify-windows.exe", "Windows", "windows")}{dl("Hiddify-android.apk", "Android", "android")}'
-             f'{dl("Hiddify-macos.dmg", "Mac", "mac")}{store("https://apps.apple.com/us/app/hiddify-proxy-vpn/id6596777532", "iPhone / iPad — Hiddify")}</div>'
+             f'<div class="dls">{download("Hiddify-windows.exe", "Windows", "windows")}{download("Hiddify-android.apk", "Android", "android")}'
+             f'{download("Hiddify-macos.dmg", "Mac", "mac")}{store("https://apps.apple.com/us/app/hiddify-proxy-vpn/id6596777532", "iPhone / iPad — Hiddify")}</div>'
              f'<p class="note">Если Hiddify нет в App Store вашей страны, подойдёт '
              f'<a class="inline" href="https://apps.apple.com/us/app/incy/id6756943388" target="_blank" rel="noopener">INCY</a> — ссылка подключения та же. '
              f'Версия указана у файла для вашей платформы.</p>{android_note}')
@@ -1534,9 +1503,9 @@ def render_user(u, client_ip):
         "Принципиально другой протокол (AmneziaWG), не связанный с Hiddify и Happ. Может работать, когда они не подключаются — например, если их блокирует провайдер, мобильная сеть или сеть на работе.",
         "Windows · Android · Mac · iPhone и iPad",
         step(1, "Установите приложение",
-             f'<div class="dls">{dl("AmneziaVPN-windows.exe", "Windows", "windows")}{dl("AmneziaVPN-android.apk", "Android", "android")}'
-             f'{dl("AmneziaVPN-macos.pkg", "Mac", "mac")}{store("https://apps.apple.com/us/app/amneziavpn/id1600529900", "iPhone / iPad — App Store")}</div>'
-             f'<p class="note">Старый Android (9–10): {dl("AmneziaVPN-android-9-10.apk", "Android 9–10") or "—"} '
+             f'<div class="dls">{download("AmneziaVPN-windows.exe", "Windows", "windows")}{download("AmneziaVPN-android.apk", "Android", "android")}'
+             f'{download("AmneziaVPN-macos.pkg", "Mac", "mac")}{store("https://apps.apple.com/us/app/amneziavpn/id1600529900", "iPhone / iPad — App Store")}</div>'
+             f'<p class="note">Старый Android (9–10): {download("AmneziaVPN-android-9-10.apk", "Android 9–10") or "—"} '
              f'Если Amnezia нет в App Store вашей страны: <a class="inline" href="https://apps.apple.com/us/app/defaultvpn/id6744725017" target="_blank" rel="noopener">DefaultVPN</a>. '
              f'Нужна версия 4.8.12.9 или новее. Версия файла указана у кнопки скачивания.</p>{android_note}')
         + step(2, "Добавьте подключение",
@@ -1553,8 +1522,9 @@ def render_user(u, client_ip):
         "Прокси, чтобы Telegram работал без включённого VPN. Другие сайты и приложения он не открывает. Если у вас уже работает VPN — это не нужно.",
         "Везде, где есть Telegram",
         step(1, "Установите Telegram, если его ещё нет",
-             f'<div class="dls">{dl("Telegram-windows.exe", "Windows", "windows")}{dl("Telegram-android.apk", "Android", "android")}'
-             f'{dl("Telegram-macos.dmg", "Mac", "mac")}{store("https://apps.apple.com/app/telegram-messenger/id686449807", "iPhone / iPad — App Store")}</div>')
+             f'<div class="dls">{download("Telegram-windows.exe", "Windows", "windows")}{download("Telegram-android.apk", "Android", "android")}'
+             f'{download("Telegram-macos.dmg", "Mac", "mac")}{store("https://apps.apple.com/app/telegram-messenger/id686449807", "iPhone / iPad — App Store")}</div>'
+             f'<p>{store("https://telegram.org/android", "Telegram для Android — официальный сайт", "android")}</p>')
         + step(2, "Включите прокси",
              connect_block(tg_link, "m", "tg-uri", tg_link, f'<a class="btn" href="{esc(tg_link)}">Подключить в Telegram</a>',
                            "Кнопка откроет Telegram — нажмите там «Подключить прокси». Или отсканируйте QR-код камерой телефона:")
@@ -1681,7 +1651,7 @@ class H(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(b)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Robots-Tag", "noindex")
-        self.send_header("Referrer-Policy", "same-origin")
+        self.send_header("Referrer-Policy", "no-referrer")
         for k, v in (extra or {}).items():
             self.send_header(k, v)
         self.end_headers()
@@ -1704,11 +1674,18 @@ class H(BaseHTTPRequestHandler):
     def do_GET(self):
         url = urlparse(self.path)
         p = url.path
-        if PUBLIC and not re.fullmatch(r"/(?:sub|c)/[a-z0-9-]+(?:/conf)?/?", p):
+        if PUBLIC and not (p.startswith("/app/") or re.fullmatch(r"/(?:sub|c)/[a-z0-9-]+(?:/conf)?/?", p)):
             return self.not_found()
         try:
+            if p.startswith("/app/"):
+                if not PUBLIC: return self.not_found()
+                import downloads
+                capability = parse_qs(url.query).get("access", [""])[0]
+                _, user = find_by_page(capability)
+                return downloads.send(self, APP_DIR, p.removeprefix("/app/"), bool(user))
             if p == "/healthz" and not PUBLIC:
                 rw("GET", "/api/nodes")
+                if health.failures(): return self.send(503, 'Background tasks unhealthy', 'text/plain')
                 return self.send(200, "ready", "text/plain")
             m = re.fullmatch(r"/(?:sub|c)/([a-z0-9-]+)(/conf)?/?", p)
             if m:
@@ -1785,12 +1762,16 @@ class H(BaseHTTPRequestHandler):
         try:
             if p == "/login":
                 nxt = safe_next(form.get("next", [""])[0])
+                if not LOGIN_LIMITS.allowed(self.client_ip()):
+                    return self.send(429, 'Слишком много попыток. Повторите через 10 минут.', 'text/plain', {'Retry-After': '600'})
                 role = password_role(form.get("password", [""])[0])
                 if not role:
+                    print('LOGIN rejected:', self.client_ip(), flush=True)
                     time.sleep(2)
                     return self.send(200, render_login("Неверный пароль", nxt))
                 if role == "u" and need_for(nxt) == "a":
                     return self.send(200, render_login("Этот пароль — модератора: панель Remnawave доступна только администратору", nxt))
+                print('LOGIN accepted:', role, self.client_ip(), flush=True)
                 return self.send(303, "", extra={"Location": nxt, "Set-Cookie":
                                  f"gvs={make_session(role)}; Path=/; Max-Age={SESSION_TTL}; HttpOnly; Secure; SameSite=Strict"})
             if p.startswith("/admin") and not has_role(self.headers.get("Cookie"), need_for(p)):
@@ -1883,9 +1864,10 @@ elif __name__ == "__main__":
         import_existing()
     except Exception as e:
         print("initial import failed:", e, flush=True)
-    threading.Thread(target=background, daemon=True).start()
-    threading.Thread(target=servers.watchdog, daemon=True).start()
+    health.start('background', background, 60)
+    health.start('watchdog', servers.watchdog_tick, 30)
     if DATA:
-        threading.Thread(target=scheduler, daemon=True).start()
+        import maintenance
+        maintenance.start()
     print("geovpn-portal listening on %s:%d" % LISTEN, flush=True)
     WebServer(LISTEN, H).serve_forever()

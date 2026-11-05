@@ -10,12 +10,14 @@ FROM docker:27-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b4
 
 FROM python:3.12-slim@sha256:f77ac9e44ae96ef2c90b8053ea08c31f8be030f824196b0ae4db6d462c84e51f
 RUN apt-get update && apt-get install -y --no-install-recommends curl iproute2 iptables openssh-client procps bash \
-    ca-certificates tar gzip && rm -rf /var/lib/apt/lists/* \
+    ca-certificates tar gzip openssl && rm -rf /var/lib/apt/lists/* \
  && pip install --no-cache-dir segno==1.6.6 paramiko==5.0.0
 COPY --from=dockercli /usr/local/bin/docker /usr/local/bin/docker
 COPY --from=awgtools /out/usr/bin/awg /out/usr/bin/awg-quick /usr/bin/
 COPY portal/ /app/
 COPY config/direct.json /app/config/direct.json
+ARG SOURCE_COMMIT
+RUN echo "$SOURCE_COMMIT" | grep -Eq '^[0-9a-f]{40}$' && printf '{"commit":"%s"}\n' "$SOURCE_COMMIT" > /app/release.json
 RUN chmod +x /app/cli.py /app/scripts/*.sh && ln -s /app/cli.py /usr/local/bin/geovpn
 ENV GEOVPN_DATA=/data PYTHONUNBUFFERED=1 TZ=Europe/Moscow
 WORKDIR /app

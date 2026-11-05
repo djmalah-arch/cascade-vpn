@@ -53,6 +53,11 @@ def trace_result(body, db):
     return {"ip": ip, "country": fields.get("loc", "?"), "path": path, "name": name}
 
 
+def ipv6_verified(observed):
+    return bool(observed and observed.get('path') == 'vpn'
+                and ipaddress.ip_address(observed['ip']).version == 6)
+
+
 def route_from_log(body, uid, inbound, target):
     """Only an authenticated, dedicated diagnostic user's exact destination is evidence."""
     found = []
@@ -215,7 +220,7 @@ def run(log, target="", check_ipv6=True):
                     if check_ipv6:
                         ipv6 = client.request("https://api6.ipify.org")
                         observed6 = trace_result(ipv6.stdout, db) if ipv6.returncode == 0 else None
-                        if observed6 and ipaddress.ip_address(observed6["ip"]).version == 6:
+                        if ipv6_verified(observed6):
                             record["ipv6"] = {**observed6, "verified": True}
                             log(f"{kind} · IPv6: {observed6['ip']} ({observed6['name']}).")
                         else:

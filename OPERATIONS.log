@@ -1,3 +1,9 @@
 2026-11-05: Applied ub-mode. Saved full pre-change backup locally and on MSK/ServForTest1; SHA-256 matched. Saved source Git bundle.
 2026-11-05: Reproduced AWG child leak, predictable empty MTProxy secret, and missing IPv6 recovery switch with failing regression tests.
 2026-11-05: Replaced process substitution with two waited commands and private temporary config; added container init; persisted random disabled secret; restored preferred IPv6 after recovery.
+2026-11-05: Deployed emergency commit 872c4e4 after 40 passing Linux tests. Portal process count dropped from about 1430 to 6; VPN services remained active.
+2026-11-05: Created recovery key locally, sent only public certificate to servers, verified CMS AES-256-GCM round trip. Encrypted existing cold-reserve backups and upgraded its restricted receiver. ServForTest1 receiver requires operator SSH access.
+2026-11-05: Split maintenance into supervised independent jobs; added task checkpoints, service health probes and resource limits. Added state schema v2, scoped user writes, independent user operation lock and nonblocking remote profile application.
+2026-11-05: Added lost-revoke recovery, login throttling, verified streaming installer downloads with personal capability, ordinary public landing, installer digest validation, backup provenance and recovery CLI. Kept existing AWG wire parameters and validated their compatibility instead of rotating client settings.
+2026-11-05: Disabled unscoped UDP game exception by migration; preserved explicit game domains/networks. Split sing-box domain/IP alternatives and added direct Russian domain zones. Tightened IPv6 confirmation and distinguished route/HTTP availability.
+2026-11-05: 52 isolated Linux regression tests passed, including real authenticated-encryption/tamper checks, timeout descendant termination, concurrent state preservation and unlocked network I/O. Compose and Bash syntax checks passed.

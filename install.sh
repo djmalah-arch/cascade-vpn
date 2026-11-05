@@ -10,6 +10,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 ROOT=$(pwd)
+export SOURCE_COMMIT=$(git rev-parse HEAD)
 DATA=$ROOT/data
 CRED=/root/geovpn-credentials.txt
 

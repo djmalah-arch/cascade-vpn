@@ -12,15 +12,21 @@ DAYS = ("Понедельник", "Вторник", "Среда", "Четвер�
 
 def synchronize(log=print):
     import cli
-    with C.LOCK:
-        db = C.load_db()
-        if not db.get("routing_pending"):
-            log("Правила уже применены.")
-            return
+    from storage import ProcessLock
+    with ProcessLock(C.DB_PATH + '.routing.lock'):
+        with C.LOCK:
+            db = C.load_db()
+            if not db.get("routing_pending"):
+                log("Правила уже применены.")
+                return
+            revision = db.get('_routing_revision', 0)
         log("Обновляю управляемую подписку Happ и профиль MSK…")
         cli.happ_routing(); cli.templates(); cli.happ_auto()
         servers.apply(db, servers.compute_plan(db))
-        db = C.load_db(); db.pop("routing_pending", None); C.save_db(db)
+        with C.LOCK:
+            db = C.load_db()
+            if db.get('_routing_revision', 0) == revision:
+                db.pop("routing_pending", None); C.save_db(db)
     log("Правила применены. Happ получит их при обновлении подписки.")
 
 
@@ -35,6 +41,8 @@ def check_summary(db):
     successful = sum(200 <= r.get("http", 0) < 300 for r in rows)
     redirected = sum(300 <= r.get("http", 0) < 400 for r in rows)
     text = f"Маршрут {confirmed}/{len(rows)} · HTTPS 2xx: {successful} · перенаправления: {redirected}" if rows else "Ещё не проверено"
+    unavailable = [r['host'] for r in rows if not 200 <= r.get('http', 0) < 400]
+    if unavailable: text += f" · требуют проверки доступа: {len(unavailable)}"
     if record.get("stale") or (rows and record.get("revision") != db.get("_routing_revision", 0)):
         text = "Правила изменились — нужна новая проверка"
     protocols = []

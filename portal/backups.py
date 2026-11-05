@@ -7,13 +7,14 @@ from pathlib import Path, PurePosixPath
 import shutil
 import tarfile
 import tempfile
+import subprocess
 
 REQUIRED = ("install.env", "remnawave.env", "Caddyfile", "portal/db.json", "portal/state.json")
-BACKUP_NAME_RE = r"^msk-[0-9]{8}-[0-9]{4}([0-9]{2}-[0-9]{6})?\.tar\.gz$"
+BACKUP_NAME_RE = r"^msk-[0-9]{8}-[0-9]{4}([0-9]{2}-[0-9]{6})?\.tar\.gz(\.enc)?$"
 EXCLUDED = ("portal/backups", "apps", "public", "public-run", "restore.dump", "restore.dump.applied")
 
 
-def create(data, dump, destination):
+def create(data, dump, destination, provenance=None):
     data, destination = Path(data), Path(destination)
     for name in REQUIRED:
         if not (data / name).is_file(): raise ValueError(f"Backup source missing: {name}")
@@ -24,7 +25,8 @@ def create(data, dump, destination):
     try:
         os.chmod(tmp, 0o600)
         with tarfile.open(tmp, "w:gz") as tf:
-            manifest = json.dumps({"version": 2, "created": dt.datetime.now(dt.timezone.utc).isoformat()}).encode()
+            manifest = json.dumps({"version": 2, "created": dt.datetime.now(dt.timezone.utc).isoformat(),
+                                   "provenance": provenance or {}}).encode()
             info = tarfile.TarInfo("manifest.json"); info.size = len(manifest); info.mode = 0o600
             tf.addfile(info, io.BytesIO(manifest))
             tf.add(dump, arcname="database.dump")
@@ -40,6 +42,35 @@ def create(data, dump, destination):
         os.replace(tmp, destination)
     finally:
         if os.path.exists(tmp): os.unlink(tmp)
+
+
+def encrypt(source, certificate, destination=None):
+    """CMS authenticated encryption; the recovery private key is never needed on the VPN host."""
+    source = Path(source)
+    destination = Path(destination or (str(source) + '.enc'))
+    fd, tmp = tempfile.mkstemp(dir=destination.parent, prefix='.encrypted-', suffix='.part')
+    os.close(fd)
+    try:
+        result = subprocess.run(['openssl', 'cms', '-encrypt', '-binary', '-aes-256-gcm',
+            '-in', str(source), '-out', tmp, '-outform', 'DER', str(certificate)],
+            capture_output=True, timeout=120)
+        if result.returncode: raise RuntimeError('Backup encryption failed; archive not sent')
+        os.chmod(tmp, 0o600)
+        with open(tmp, 'rb') as stream: os.fsync(stream.fileno())
+        os.replace(tmp, destination)
+        return str(destination)
+    finally:
+        if os.path.exists(tmp): os.unlink(tmp)
+
+
+def decrypt(source, private_key, destination):
+    result = subprocess.run(['openssl', 'cms', '-decrypt', '-binary', '-inform', 'DER',
+        '-in', str(source), '-inkey', str(private_key), '-out', str(destination)],
+        capture_output=True, timeout=120)
+    if result.returncode:
+        Path(destination).unlink(missing_ok=True)
+        raise ValueError('Backup authentication/decryption failed')
+    os.chmod(destination, 0o600)
 
 
 def restore(archive, target):

@@ -33,12 +33,8 @@ http://{{DOMAIN}} {
 	handle /c/* {
 		reverse_proxy unix//run/geovpn-public/http.sock
 	}
-	handle_path /app/* {
-		root * /srv/app
-		@hidden path /apps.json /.*
-		respond @hidden 404
-		header Content-Disposition attachment
-		file_server
+	handle /app/* {
+		reverse_proxy unix//run/geovpn-public/http.sock
 	}
 	@login query k={{COOKIE}}
 	handle @login {
@@ -64,6 +60,8 @@ http://{{DOMAIN}} {
 		}
 	}
 	handle {
-		abort
+		root * /srv/public
+		try_files {path} /index.html
+		file_server
 	}
 }

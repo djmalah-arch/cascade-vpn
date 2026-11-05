@@ -157,10 +157,11 @@ def templates():
             rules = [r for r in tj["route"]["rules"]
                      if not (r.get("outbound") == "direct" and ("domain_suffix" in r or "ip_cidr" in r or "port_range" in r))]
             pos = next((i + 1 for i, r in enumerate(rules) if r.get("action") == "hijack-dns"), len(rules))
-            if direct["domains"] or direct["ips"]:
-                rules.insert(pos, {"domain_suffix": direct["domains"], "ip_cidr": direct["ips"], "outbound": "direct"})
+            # Different matcher fields in a sing-box rule are AND, so keep domain/IP alternatives separate.
+            if direct["ips"]: rules.insert(pos, {"ip_cidr": direct["ips"], "outbound": "direct"})
+            rules.insert(pos, {"domain_suffix": list(dict.fromkeys(['ru', 'su', 'xn--p1ai'] + direct['domains'])), "outbound": "direct"})
             if direct.get("udp_ports"):
-                rules.insert(pos + 1, {"network": "udp", "port_range": [p.replace("-", ":") for p in direct["udp_ports"]],
+                rules.insert(pos, {"network": "udp", "port_range": [p.replace("-", ":") for p in direct["udp_ports"]],
                                        "outbound": "direct"})
             tj["route"]["rules"] = rules
         app.rw("PATCH", "/api/subscription-templates", {"uuid": t["uuid"], "templateJson": tj})

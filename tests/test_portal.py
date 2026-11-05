@@ -85,7 +85,9 @@ class PortalTests(unittest.TestCase):
         self.assertFalse(any(b["tag"] == "pin-disabled" for b in cfg["routing"]["balancers"]))
 
     def test_private_block_precedes_direct_udp(self):
-        rules = self.profile()["routing"]["rules"]
+        import routing_policy
+        with patch.object(routing_policy, 'direct_config', return_value={'domains': [], 'ips': [], 'udp_ports': ['19000-20999']}):
+            rules = self.profile()["routing"]["rules"]
         private = next(i for i, r in enumerate(rules) if r.get("ip") == ["geoip:private"])
         udp = next(i for i, r in enumerate(rules) if r.get("network") == "udp" and r.get("outboundTag") == "direct")
         self.assertLess(private, udp)
