@@ -143,6 +143,7 @@ services:
     <<: *log
 
   portal:
+    init: true
     build: { context: ., dockerfile: portal/Dockerfile }
     image: geovpn/portal
     container_name: geovpn-portal

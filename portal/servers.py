@@ -668,6 +668,9 @@ def must_switch(db, old, new):
     # plans from before the family pinning: move the primary to IPv6 once
     if "fam" not in old and any(new.get("fam", {}).values()):
         return True
+    if any(f == "6" and old.get("fam", {}).get(i) != "6" and is_up(i)
+           for i, f in new.get("fam", {}).items()):
+        return True
     fb = old.get("fallback")
     if fb and new.get("fallback") and (new.get("fallback"), new.get("fb_tag")) != (fb, old.get("fb_tag")):
         family = "v6" if (old.get("fb_tag") or "").endswith("-6") else "v4"

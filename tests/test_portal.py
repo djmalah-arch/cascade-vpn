@@ -44,10 +44,10 @@ class PortalTests(unittest.TestCase):
 
     def test_awg_retries_failed_apply_without_file_change(self):
         with patch.object(app, "rw_users", return_value=self.active), patch.object(app, "mt_apply"), \
-             patch.object(app, "sh", side_effect=[(1, "failure"), (0, "")]) as run:
+             patch.object(app, "sh", side_effect=[(0, "[Interface]"), (1, "failure"), (0, "[Interface]"), (0, "")]) as run:
             with self.assertRaises(RuntimeError): app.awg_apply(self.db)
             app.awg_apply(self.db)
-        self.assertEqual(run.call_count, 2)
+        self.assertEqual(run.call_count, 4)
 
     def test_user_creation_resumes_after_lost_api_response_without_duplicate(self):
         remote = []

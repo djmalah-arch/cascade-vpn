@@ -1,0 +1,3 @@
+2026-11-05: Applied ub-mode. Saved full pre-change backup locally and on MSK/ServForTest1; SHA-256 matched. Saved source Git bundle.
+2026-11-05: Reproduced AWG child leak, predictable empty MTProxy secret, and missing IPv6 recovery switch with failing regression tests.
+2026-11-05: Replaced process substitution with two waited commands and private temporary config; added container init; persisted random disabled secret; restored preferred IPv6 after recovery.
