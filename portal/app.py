@@ -1006,8 +1006,8 @@ def background():
         CACHE["mon"] = (mon, time.time())
     bad = [k for k, v in mon["services"].items() if v != "active"]
     if time.time() - STARTED > STARTUP_GRACE:
-        if bad: log_error("?????? MSK ?? ????????: " + ", ".join(bad))
-        if not mon.get("youtube"): log_error("YouTube ? MSK ??????????")
+        if bad: log_error("Службы MSK не работают: " + ", ".join(bad))
+        if not mon.get("youtube"): log_error("YouTube с MSK недоступен")
     import diagnostics
     diagnostics.tick()
 
