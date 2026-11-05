@@ -159,7 +159,7 @@ AWG-клиент работает в отдельном namespace и не мен
 ## Обновление
 
 ```bash
-cd /opt/cascade-vpn && git pull && docker compose build && docker compose up -d
+cd /opt/cascade-vpn && git pull && SOURCE_COMMIT=$(git rev-parse HEAD) docker compose build && docker compose up -d
 ```
 Все образы закреплены (версия + хэш) в `docker-compose.yml`, сами они не обновятся. Обновляйте осознанно: поменять хэш,
 проверить, закоммитить (особенно ноду xray — см. «Hiddify не подключается»).

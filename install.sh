@@ -108,6 +108,10 @@ chmod 755 "$DATA/public"
 chown 65534:65534 "$DATA/public-run"
 chmod 750 "$DATA/public-run"
 chmod 700 "$DATA"
+if [ ! -f "$DATA/portal/backup-recipient.pem" ]; then
+  [ -n "${BACKUP_RECIPIENT_CERT:-}" ] && [ -r "$BACKUP_RECIPIENT_CERT" ] || die "Set BACKUP_RECIPIENT_CERT to an offline-generated recovery PUBLIC certificate; keep its private key off this server"
+  install -m 644 "$BACKUP_RECIPIENT_CERT" "$DATA/portal/backup-recipient.pem"
+fi
 for v in SERVER_IP DOMAIN BRAND RW_ADMIN_USER AWG_PORT MTP_PORT; do printf '%s=%q
 ' "$v" "${!v}"; done > "$DATA/install.env"
 chmod 600 "$DATA/install.env"

@@ -41,7 +41,7 @@ services:
   remnawave:
     mem_limit: 640m
     pids_limit: 256
-    healthcheck: { test: ["CMD", "node", "-e", "require('http').get('http://127.0.0.1:3000/api/auth/status',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"], interval: 30s, timeout: 10s, retries: 3, start_period: 90s }
+    healthcheck: { test: ["CMD", "node", "-e", "require('http').get({host:'127.0.0.1',port:3000,path:'/api/auth/status',headers:{'X-Forwarded-Proto':'https','X-Forwarded-For':'127.0.0.1'}},r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"], interval: 30s, timeout: 10s, retries: 3, start_period: 90s }
     image: ${REMNAWAVE_IMAGE:-remnawave/backend:3.4.4@sha256:63ef481550bbf49dabfa514c95d94109619cc85607730b308f7ad0b9b5599f06}
     container_name: remnawave
     restart: always

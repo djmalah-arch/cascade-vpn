@@ -40,6 +40,7 @@ def start(name, function, interval):
     checkpoint(name, True)
     def worker():
         while True:
+            delay = interval
             try:
                 function()
                 checkpoint(name, True)
@@ -48,7 +49,8 @@ def start(name, function, interval):
                 try: checkpoint(name, False, type(error).__name__)
                 except Exception: pass
                 print('task failed:', name, type(error).__name__, flush=True)
-            time.sleep(interval)
+                delay = min(interval, 30)
+            time.sleep(delay)
     thread = threading.Thread(target=worker, name=name, daemon=True)
     thread.start()
     return thread
