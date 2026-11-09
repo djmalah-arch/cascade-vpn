@@ -1651,7 +1651,8 @@ class H(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(b)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Robots-Tag", "noindex")
-        self.send_header("Referrer-Policy", "no-referrer")
+        # Keep Origin on same-origin form POSTs; no-referrer can turn it into null.
+        self.send_header("Referrer-Policy", "same-origin")
         for k, v in (extra or {}).items():
             self.send_header(k, v)
         self.end_headers()
